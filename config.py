@@ -5,8 +5,6 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from dotenv import dotenv_values
-
 # ---- 路径 ----
 PKG_DIR = Path(__file__).resolve().parent
 ROOT = PKG_DIR  # 项目根
@@ -64,7 +62,7 @@ CTRL_HZ = 10
 CTRL_DT = 1.0 / CTRL_HZ
 
 # 正常结束决策后继续运行的仿真秒数，再评定结果；继续采集，不调用模型。
-# 保持臂/爪目标并停止底盘；按控制周期向上取整，0 禁用。异常、关窗和演示跳过。
+# 保持臂/爪目标并停止底盘；按控制周期向上取整，0 禁用。异常和关窗跳过。
 EPISODE_SETTLE_SECONDS = 3.0
 
 # ---- 动作原语 (低层时间盒控制) ----
@@ -106,41 +104,9 @@ RAND_PHYS = 0.2
 # ---- Brain / LLM ----
 MAX_DECISIONS = 32
 LLM_TIMEOUT_S = 180.0   # 大 max_tokens 下思考链长, 单请求可能超 60s
-LLM_RETRIES = 3          # 超时/连接错/5xx 自动重试
-LLM_MAX_TOKENS = 65536   # 单次模型输出 token 上限；开启思考时需同时容纳 reasoning 和工具调用
-LLM_MAX_IMAGE_EDGE = 1024
-LLM_TERM_IMAGES = True      # 终端内联显示发给 LLM 的相机图 (需 Kitty 图形协议终端, 如 Ghostty)
-HISTORY_LINES = 12
-
-ENV_OPENAI_BASE = "LLM_BASE_URL"
-ENV_OPENAI_KEY = "LLM_API_KEY"
-ENV_OPENAI_MODEL = "LLM_MODEL"
-ENV_ANTHROPIC_KEY = "ANTHROPIC_API_KEY"
-ENV_ANTHROPIC_MODEL = "ANTHROPIC_MODEL"
-
-# 只读取本项目 .env，不改写进程环境，不展开其中的 ${...} 或执行 shell。
-# dotenv_values 支持引号、注释与 Windows BOM；密钥不写入已跟踪的源码。
+LLM_MAX_TOKENS = 65536
+# VISTA 自行读取 .env/进程环境；凭据不进入源码或日志。
 LOCAL_LLM_FILE = ROOT / ".env"
-_local_llm = dotenv_values(LOCAL_LLM_FILE, encoding="utf-8-sig", interpolate=False)
-
-
-def _local_setting(*names: str, default=""):
-    return next((_local_llm[n] for n in names if _local_llm.get(n)), default)
-
-
-# ---- OpenAI 兼容端点；本地配置文件优先，default 为源码默认值 ----
-LLM_BASE_URL = _local_setting("LLM_BASE_URL", "OPENAI_BASE_URL")
-LLM_API_KEY = _local_setting("LLM_API_KEY", "OPENAI_API_KEY")
-LLM_MODEL = _local_setting("LLM_MODEL", "OPENAI_MODEL")
-OPENAI_MAX_TOKENS = _local_setting("OPENAI_MAX_TOKENS", "max_tokens", default=LLM_MAX_TOKENS)
-OPENAI_THINKING = _local_setting("OPENAI_THINKING", "thinking")
-OPENAI_REASONING_EFFORT = _local_setting("OPENAI_REASONING_EFFORT", "reasoning_effort")
-OPENAI_STREAM = _local_setting("OPENAI_STREAM", "stream", default="false")
-
-# 两类 API 的端点和密钥分别配置，避免把 OpenAI 协议的凭据发到 Anthropic 端点。
-ANTHROPIC_BASE_URL = _local_setting("ANTHROPIC_BASE_URL")
-ANTHROPIC_API_KEY = _local_setting("ANTHROPIC_API_KEY")
-ANTHROPIC_MODEL_DEFAULT = _local_setting("ANTHROPIC_MODEL")
 
 
 def ensure_dirs() -> None:

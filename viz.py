@@ -67,7 +67,7 @@ class GuiViewer:
         return self._viewer.is_running()
 
     def set_status(self, text: str) -> None:
-        """显示演示标签；旧版 MuJoCo 没有此接口时仍可正常演示。"""
+        """显示采集状态；旧版 MuJoCo 没有此接口时跳过。"""
         if hasattr(self._viewer, "set_texts"):
             self._viewer.set_texts((None, mujoco.mjtGridPos.mjGRID_BOTTOMLEFT, text, ""))
 

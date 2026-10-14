@@ -1,5 +1,0 @@
-# Optional LangGraph / VISTA brains: python -m pip install -r requirements-langgraph.txt
--r requirements.txt
-langgraph==1.2.12
-langgraph-checkpoint-sqlite==3.1.1
-langchain-core==1.6.5

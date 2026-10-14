@@ -9,7 +9,7 @@ from pathlib import Path
 from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.graph.message import add_messages
 
-from brains.base import Brain, Decision
+from .base import Brain, Decision
 from .graph import build_graph
 from .model import ChatModel, image_message
 from .settings import VistaSettings

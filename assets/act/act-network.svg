@@ -1,0 +1,117 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1760" height="1450" viewBox="0 0 1760 1450">
+<rect width="1760" height="1450" fill="#f8fafc"/>
+<text x="48" y="35" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="37" font-weight="700" fill="#14283f">ACT：训练支线与部署主线</text>
+<text x="48" y="92" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="23" font-weight="400" fill="#526579">本文示例：B 批量，C=1，H×W=240×320，Ds=Da=5，K=20，d=512，z_dim=32</text>
+<text x="48" y="150" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="26" font-weight="700" fill="#6652a8">A  只在训练时使用：CVAE 后验编码器 qφ(z | s_t, A_t)</text>
+<rect x="48" y="205" width="340" height="170" rx="16" fill="#f1edff" stroke="#c7d4e2" stroke-width="2"/>
+<text x="68" y="220" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="26" font-weight="700" fill="#14283f">当前状态 + 专家动作块</text>
+<text x="68" y="261" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="23" font-weight="400" fill="#14283f">s_t  [B, Ds]</text>
+<text x="68" y="295" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="23" font-weight="400" fill="#14283f">A_t  [B, K, Da]</text>
+<text x="68" y="329" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="23" font-weight="400" fill="#14283f">is_pad=True 表示补齐</text>
+<rect x="453" y="205" width="420" height="170" rx="16" fill="#f1edff" stroke="#c7d4e2" stroke-width="2"/>
+<text x="473" y="220" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="26" font-weight="700" fill="#14283f">[CLS] + 状态 token + K 动作</text>
+<text x="473" y="261" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="22" font-weight="400" fill="#14283f">各自线性投影 + 序列位置编码</text>
+<text x="473" y="295" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="22" font-weight="400" fill="#14283f">Transformer Encoder（独立参数）</text>
+<text x="473" y="329" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="22" font-weight="400" fill="#14283f">补齐动作不参与注意力的 K/V</text>
+<rect x="938" y="205" width="330" height="170" rx="16" fill="#f1edff" stroke="#c7d4e2" stroke-width="2"/>
+<text x="958" y="220" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="26" font-weight="700" fill="#14283f">只取 CLS 的输出</text>
+<text x="958" y="261" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="23" font-weight="400" fill="#14283f">线性映射到 2 × z_dim</text>
+<text x="958" y="295" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="23" font-weight="400" fill="#14283f">分成 μ 与 log σ²</text>
+<text x="958" y="329" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="23" font-weight="400" fill="#14283f">二者均为 [B, 32]</text>
+<rect x="1333" y="205" width="375" height="170" rx="16" fill="#f1edff" stroke="#c7d4e2" stroke-width="2"/>
+<text x="1353" y="220" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="26" font-weight="700" fill="#14283f">重参数化得到 z</text>
+<text x="1353" y="261" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="23" font-weight="400" fill="#14283f">σ = exp(0.5 × log σ²)</text>
+<text x="1353" y="295" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="23" font-weight="400" fill="#14283f">z = μ + σ × ε</text>
+<text x="1353" y="329" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="23" font-weight="400" fill="#14283f">ε ~ N(0, I)</text>
+<polyline points="388,290 453,290" fill="none" stroke="#8270ba" stroke-width="3" stroke-linejoin="round"/>
+<polygon points="453.0,290.0 441.3,295.7 441.3,284.3" fill="#8270ba"/>
+<polyline points="873,290 938,290" fill="none" stroke="#8270ba" stroke-width="3" stroke-linejoin="round"/>
+<polygon points="938.0,290.0 926.3,295.7 926.3,284.3" fill="#8270ba"/>
+<polyline points="1268,290 1333,290" fill="none" stroke="#8270ba" stroke-width="3" stroke-linejoin="round"/>
+<polygon points="1333.0,290.0 1321.3,295.7 1321.3,284.3" fill="#8270ba"/>
+<text x="48" y="425" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="26" font-weight="700" fill="#245a9c">B  训练和部署共用：策略网络 πθ(A_t | o_t, z)</text>
+<rect x="48" y="485" width="310" height="175" rx="16" fill="#e8f6f2" stroke="#c7d4e2" stroke-width="2"/>
+<text x="68" y="500" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="26" font-weight="700" fill="#14283f">车头图像</text>
+<text x="68" y="541" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="23" font-weight="400" fill="#14283f">[B, C, 3, H, W]</text>
+<text x="68" y="575" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="23" font-weight="400" fill="#14283f">像素 / 255</text>
+<text x="68" y="609" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="23" font-weight="400" fill="#14283f">ImageNet 通道标准化</text>
+<rect x="423" y="485" width="395" height="175" rx="16" fill="#eaf2ff" stroke="#c7d4e2" stroke-width="2"/>
+<text x="443" y="500" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="26" font-weight="700" fill="#14283f">ResNet-18 + 1×1 Conv</text>
+<text x="443" y="541" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="22" font-weight="400" fill="#14283f">移除分类头；投影到 d 通道</text>
+<text x="443" y="575" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="22" font-weight="400" fill="#14283f">[B×C, d, 8, 10]</text>
+<text x="443" y="609" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="22" font-weight="400" fill="#14283f">展平：80 个视觉 token / 相机</text>
+<rect x="883" y="485" width="370" height="175" rx="16" fill="#eaf2ff" stroke="#c7d4e2" stroke-width="2"/>
+<text x="903" y="500" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="26" font-weight="700" fill="#14283f">视觉位置与来源</text>
+<text x="903" y="541" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="23" font-weight="400" fill="#14283f">二维正弦位置编码</text>
+<text x="903" y="575" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="23" font-weight="400" fill="#14283f">本设计显式加入相机编号</text>
+<text x="903" y="609" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="23" font-weight="400" fill="#14283f">加上视觉类型嵌入</text>
+<polyline points="358,570 423,570" fill="none" stroke="#718398" stroke-width="3" stroke-linejoin="round"/>
+<polygon points="423.0,570.0 411.3,575.7 411.3,564.3" fill="#718398"/>
+<polyline points="818,570 883,570" fill="none" stroke="#718398" stroke-width="3" stroke-linejoin="round"/>
+<polygon points="883.0,570.0 871.3,575.7 871.3,564.3" fill="#718398"/>
+<rect x="48" y="710" width="310" height="145" rx="16" fill="#e8f6f2" stroke="#c7d4e2" stroke-width="2"/>
+<text x="68" y="725" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="26" font-weight="700" fill="#14283f">当前实测状态 s_t</text>
+<text x="68" y="766" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="21" font-weight="400" fill="#14283f">按训练集统计归一化</text>
+<text x="68" y="800" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="21" font-weight="400" fill="#14283f">Linear(Ds → d)：1 个 token</text>
+<rect x="423" y="710" width="395" height="145" rx="16" fill="#f1edff" stroke="#c7d4e2" stroke-width="2"/>
+<text x="443" y="725" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="26" font-weight="700" fill="#14283f">潜变量 z</text>
+<text x="443" y="766" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="22" font-weight="400" fill="#14283f">训练：来自上方后验分支</text>
+<text x="443" y="800" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="22" font-weight="400" fill="#14283f">部署：固定 z=0；Linear → d</text>
+<polyline points="1520,375 1520,407 848,407 848,687 620,687 620,710" fill="none" stroke="#8270ba" stroke-width="3" stroke-linejoin="round"/>
+<polygon points="620.0,710.0 614.3,698.3 625.7,698.3" fill="#8270ba"/>
+<rect x="883" y="710" width="370" height="145" rx="16" fill="#eaf2ff" stroke="#c7d4e2" stroke-width="2"/>
+<text x="903" y="725" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="26" font-weight="700" fill="#14283f">拼接多模态 token</text>
+<text x="903" y="766" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="22" font-weight="400" fill="#14283f">状态 1 + 潜变量 1 + 图像 80</text>
+<text x="903" y="800" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="22" font-weight="400" fill="#14283f">N = C×h×w + 2 = 82</text>
+<polyline points="1068,660 1068,710" fill="none" stroke="#718398" stroke-width="3" stroke-linejoin="round"/>
+<polygon points="1068.0,710.0 1062.3,698.3 1073.7,698.3" fill="#718398"/>
+<polyline points="358,783 390,783 390,877 860,877 860,815 883,815" fill="none" stroke="#718398" stroke-width="3" stroke-linejoin="round"/>
+<polygon points="883.0,815.0 871.3,820.7 871.3,809.3" fill="#718398"/>
+<polyline points="818,770 883,770" fill="none" stroke="#718398" stroke-width="3" stroke-linejoin="round"/>
+<polygon points="883.0,770.0 871.3,775.7 871.3,764.3" fill="#718398"/>
+<rect x="1318" y="485" width="390" height="370" rx="16" fill="#eaf2ff" stroke="#c7d4e2" stroke-width="2"/>
+<text x="1338" y="500" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="26" font-weight="700" fill="#14283f">策略 Transformer Encoder</text>
+<text x="1338" y="541" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="23" font-weight="400" fill="#14283f">本设计 L_enc = 4 层</text>
+<text x="1338" y="575" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="23" font-weight="400" fill="#14283f">每层：</text>
+<text x="1338" y="609" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="23" font-weight="400" fill="#14283f">多头 Self-Attention</text>
+<text x="1338" y="643" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="23" font-weight="400" fill="#14283f">Residual + LayerNorm</text>
+<text x="1338" y="677" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="23" font-weight="400" fill="#14283f">FFN + Residual + LayerNorm</text>
+<text x="1338" y="711" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="23" font-weight="400" fill="#14283f">输出 memory [B, 82, 512]</text>
+<polyline points="1253,782 1285,782 1285,740 1318,740" fill="none" stroke="#718398" stroke-width="3" stroke-linejoin="round"/>
+<polygon points="1318.0,740.0 1306.3,745.7 1306.3,734.3" fill="#718398"/>
+<text x="48" y="930" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="26" font-weight="700" fill="#245a9c">C  K 个动作槽并行解码；没有自回归循环，没有因果掩码</text>
+<rect x="48" y="990" width="365" height="190" rx="16" fill="#eaf2ff" stroke="#c7d4e2" stroke-width="2"/>
+<text x="68" y="1005" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="26" font-weight="700" fill="#14283f">K 个可学习 Action Query</text>
+<text x="68" y="1046" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="23" font-weight="400" fill="#14283f">query_pos [K, d]</text>
+<text x="68" y="1080" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="23" font-weight="400" fill="#14283f">内容 tgt 初始化为 0</text>
+<text x="68" y="1114" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="23" font-weight="400" fill="#14283f">每个槽对应未来一个控制拍</text>
+<rect x="478" y="990" width="610" height="235" rx="16" fill="#eaf2ff" stroke="#c7d4e2" stroke-width="2"/>
+<text x="498" y="1005" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="26" font-weight="700" fill="#14283f">策略 Transformer Decoder  × L_dec=7</text>
+<text x="498" y="1046" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="22" font-weight="400" fill="#14283f">1. Self-Attention：K 个动作槽彼此交流</text>
+<text x="498" y="1080" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="22" font-weight="400" fill="#14283f">2. Cross-Attention：Q 来自动作槽，K/V 来自 memory</text>
+<text x="498" y="1114" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="22" font-weight="400" fill="#14283f">3. FFN；各子层都有 Residual + LayerNorm</text>
+<text x="498" y="1148" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="22" font-weight="400" fill="#14283f">读取最后一层输出 [B, K, d]</text>
+<rect x="1153" y="990" width="555" height="190" rx="16" fill="#e8f6f2" stroke="#c7d4e2" stroke-width="2"/>
+<text x="1173" y="1005" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="26" font-weight="700" fill="#14283f">共享线性动作头 Linear(d → Da)</text>
+<text x="1173" y="1046" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="22" font-weight="400" fill="#14283f">一次输出整块 Â_t：[B, 20, 5]</text>
+<text x="1173" y="1080" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="22" font-weight="400" fill="#14283f">五维：肩目标、肘目标、夹爪目标、v、ω</text>
+<text x="1173" y="1114" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="22" font-weight="400" fill="#14283f">各槽共享头参数；通过注意力相互关联</text>
+<polyline points="413,1080 478,1080" fill="none" stroke="#718398" stroke-width="3" stroke-linejoin="round"/>
+<polygon points="478.0,1080.0 466.3,1085.7 466.3,1074.3" fill="#718398"/>
+<polyline points="1088,1080 1153,1080" fill="none" stroke="#718398" stroke-width="3" stroke-linejoin="round"/>
+<polygon points="1153.0,1080.0 1141.3,1085.7 1141.3,1074.3" fill="#718398"/>
+<polyline points="1513,855 1513,900 800,900 800,990" fill="none" stroke="#718398" stroke-width="3" stroke-linejoin="round"/>
+<polygon points="800.0,990.0 794.3,978.3 805.7,978.3" fill="#718398"/>
+<rect x="48" y="1270" width="1040" height="105" rx="16" fill="#fff1e2" stroke="#c7d4e2" stroke-width="2"/>
+<text x="68" y="1285" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="26" font-weight="700" fill="#14283f">训练：有效动作 L1 + β × KL(qφ || N(0,I))</text>
+<text x="68" y="1326" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="23" font-weight="400" fill="#14283f">专家 A_t 是监督标签，不会作为部署时的输入</text>
+<rect x="1153" y="1235" width="555" height="140" rx="16" fill="#e8f6f2" stroke="#c7d4e2" stroke-width="2"/>
+<text x="1173" y="1250" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="26" font-weight="700" fill="#14283f">部署：取当前时刻的动作</text>
+<text x="1173" y="1291" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="22" font-weight="400" fill="#14283f">时间集成（可选）→ 反归一化 → 适配器</text>
+<text x="1173" y="1325" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="22" font-weight="400" fill="#14283f">施加一个控制拍，再观察</text>
+<polyline points="1430,1180 1430,1235" fill="none" stroke="#3e8e7a" stroke-width="3" stroke-linejoin="round"/>
+<polygon points="1430.0,1235.0 1424.3,1223.3 1435.7,1223.3" fill="#3e8e7a"/>
+<polyline points="1165,1180 1120,1180 1120,1248 1060,1248 1060,1270" fill="none" stroke="#c38b4e" stroke-width="3" stroke-linejoin="round"/>
+<polygon points="1060.0,1270.0 1054.3,1258.3 1065.7,1258.3" fill="#c38b4e"/>
+<text x="48" y="1406" dominant-baseline="text-before-edge" font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="18" font-weight="400" fill="#526579">MuJoCo · VISTA → ACT  |  架构设计稿  |  2026-10-14</text>
+</svg>

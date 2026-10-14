@@ -1,6 +1,6 @@
 # VISTA Brain：用基础 LangGraph 串起视觉、动作和记忆
 
-实现日期：2026-10-08。**本目录已实现第一版 VISTA Brain，并接入 `run_collect.py --brain=vista`。** 原论文副本保留为 `VISTA-original.pdf`；原来的译本和官方源码等研究资料保留在本地 `../VISTA-docs/`。下文保留架构和工具约定，代码片段用于解释流程，完整实现以同目录的 Python 文件为准。
+实现日期：2026-10-08。**本目录已实现第一版 VISTA Brain，并接入 `run_collect.py --brain=vista`。** 旧论文、译本和官方源码快照已归档到仓库根目录 `_archive/20261013-pre-vista/files/brains/`。当前 `brains/` 仅保留 `vista/`。下文保留架构和工具约定，代码片段用于解释流程，完整实现以同目录的 Python 文件为准。
 
 第一版的目标很具体：模型收到车头图，可以一次请求多个工具来查旧图、裁图、读像素、读写笔记；用一次 `play` 提交一批 MuJoCo 动作；外层按顺序执行整批，再返回最终图片和各子动作结果；模型沿用原来的消息历史继续。先证明这条链能闭合。暂不做上下文压缩、语义图片搜索、子图或多个模型分工。多个工具请求先顺序执行、统一反馈；不要求引入并发编程。
 
@@ -8,10 +8,10 @@
 
 阅读顺序：先看文件布局和整张图，再看状态如何延续，最后逐个看工具协议。第 8 节用同一段抓球经历把它们串起来。
 
-运行前安装可选依赖，在项目 `.env` 或进程环境中配置 `max_model_calls`，以及支持**图片输入和工具调用**的 OpenAI 兼容 Chat Completions 端点、模型和密钥。密钥配置沿用 `LLM_*` / `OPENAI_*` 名称，示例见项目 `.env.example`；不要把凭据写进指南、草稿或代码。
+运行前安装项目依赖，在项目 `.env` 或进程环境中配置 `max_model_calls`，以及支持**图片输入和工具调用**的 OpenAI 兼容 Chat Completions 端点、模型和密钥。密钥配置沿用 `LLM_*` / `OPENAI_*` 名称，示例见项目 `.env.example`；不要把凭据写进指南、草稿或代码。
 
 ```bash
-python -m pip install -r requirements-langgraph.txt
+python -m pip install -r requirements.txt
 python run_collect.py --brain=vista --episodes 1 --gui --max-decisions 8
 ```
 
@@ -43,15 +43,9 @@ mujoco/
 ├── control/
 │   └── tools.py                    已有：底盘、机械臂、夹爪的真实执行函数
 ├── brains/
-│   ├── base.py                     已有：Brain 和 Decision 接口
-│   ├── langgraph/                  已有：之前的五阶段 brain
-│   ├── VISTA-docs/                 已改名：原 VISTA 研究资料
-│   │   ├── VISTA-original.pdf
-│   │   ├── VISTA-zh.pdf
-│   │   └── upstream/              官方源码快照，作为参考资料
 │   └── vista/                     新 brain 的源代码目录
 │       ├── readme.md               本设计稿
-│       ├── VISTA-original.pdf      原论文的本地副本
+│       ├── base.py                 Brain 和 Decision 接口
 │       ├── __init__.py             导出 VistaBrain
 │       ├── * brain.py              接收新观察，保存 state，交出动作，接回结果
 │       ├── * graph.py              两个节点及其条件边

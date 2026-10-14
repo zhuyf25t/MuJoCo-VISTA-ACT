@@ -4,7 +4,7 @@
 控制级 trajectory.jsonl + imgs/ —— 固定 CTRL_HZ 频率的 (图像, 状态, 底层动作),
 可直接映射为模仿学习的 (observation, action) 对.
 
-格式与 LeRobot v3 的映射见 README: observation.state = [臂7 + 爪1 + 底盘3].
+当前记录包含两关节臂、夹爪、底盘和完整仿真状态；训练数据集导出尚未实现。
 """
 
 from __future__ import annotations

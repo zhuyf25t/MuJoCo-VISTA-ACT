@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# openclaw_sim 一键运行: 自动准备环境 → 生成模型 → 采集 3 集 → 汇总
+# VISTA 一键运行: 自动准备环境 → 生成模型 → 采集 → 汇总
 # 可选透传参数(全部可省):
 #   ./run --gui                # 打开 3D 窗口边看边采
-#   ./run --brain anthropic    # 用 Claude LLM 当大脑(需 config.py 配好端点)
+#   在 .env 中配置支持图像和工具调用的模型端点，见 .env.example
 #   ./run --episodes 20        # 多采几集
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -22,5 +22,5 @@ if [ ! -f models/mobile_manip.generated.xml ]; then
     "$PY" compose_model.py > /dev/null
 fi
 
-# 2. 采集(默认: 脚本策略 3 集; 后续参数覆盖默认值)
-exec "$PY" run_collect.py --brain scripted --episodes 3 --seed 0 "$@"
+# 2. 采集(默认: VISTA 1 集; 后续参数覆盖默认值)
+exec "$PY" run_collect.py --episodes 1 --seed 0 "$@"

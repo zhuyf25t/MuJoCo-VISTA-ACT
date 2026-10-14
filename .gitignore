@@ -17,7 +17,6 @@ htmlcov/
 /tmp/
 *.log
 MUJOCO_LOG.TXT
-/brains/langgraph_temporary_file.sqlite*
 
 # Local credentials and machine-specific configuration
 .env
@@ -39,6 +38,5 @@ Thumbs.db
 *.swp
 *.swo
 
-# Local VISTA reference archives
-/brains/vista-old/
-/brains/VISTA-docs/
+# Frozen local archive; excluded from normal searches and Git
+/_archive/

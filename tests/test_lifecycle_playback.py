@@ -10,59 +10,8 @@ import numpy as np
 import pytest
 
 import config
-from brains import ScriptedBrain
-from control.perception import Detection
 from playback import Frame, PlaybackCursor, apply_frame, load_trajectory, trajectory_path
 from sim.env import MobileManipEnv
-
-
-def _sight(*detections, holding=False):
-    return {"detections": list(detections), "holding": holding, "base_pose": [0, 0, 0]}
-
-
-def _brain():
-    hal = SimpleNamespace(attached_object=lambda: None)
-    return ScriptedBrain(SimpleNamespace(robot=SimpleNamespace(hal=hal)))
-
-
-def test_new_episode_gets_fresh_grasp_retry_budget():
-    ball = Detection("ball", 100, 160, 180, 0, 0.5)
-    brain = _brain()
-    brain._see = lambda: _sight(ball)
-    previous = [brain.decide({}, "", [], []) for _ in range(20)]
-    assert previous[-1].tool == "done" and previous[-1].args == {"success": False}
-
-    brain.reset()
-    fresh = _brain()
-    fresh._see = brain._see
-    actual = [brain.decide({}, "", [], []) for _ in range(20)]
-    expected = [fresh.decide({}, "", [], []) for _ in range(20)]
-    assert actual == expected
-    assert actual[4].tool == "open_gripper"  # First miss still receives a retry.
-    assert sum(d.tool == "close_gripper" for d in actual) == 4
-
-
-def test_reset_forgets_bin_sighting_from_old_scene():
-    brain = _brain()
-    bin_det = Detection("bin", 3000, 160, 180, 30, 0.4)
-    brain._see = lambda: _sight(bin_det, holding=True)
-    brain.decide({}, "", [], [])  # Records a recent nearby bin sighting.
-    brain.reset()
-    brain._see = lambda: _sight(holding=True)
-    decision = brain.decide({}, "", [], [])
-    assert decision.tool == "turn_right"  # Search; never infer a drop from the old scene.
-    assert "扫描" in decision.thought
-
-
-def test_reset_forgets_previous_ball_target():
-    brain = _brain()
-    old = Detection("ball", 100, 100, 150, 30, 1.0)
-    brain._see = lambda: _sight(old)
-    assert brain.decide({}, "", [], []).tool == "turn_left"
-    brain.reset()
-    centered = Detection("ball", 100, 160, 150, 0, 1.0)
-    brain._see = lambda: _sight(old, centered)
-    assert brain.decide({}, "", [], []).tool == "forward"
 
 
 def test_camera_rig_closes_partial_construction(monkeypatch):
@@ -96,7 +45,8 @@ def test_episode_closes_recording_resources_on_interruption(tmp_path, monkeypatc
     monkeypatch.setattr(run_collect, "EpisodeRecorder", record)
     with MobileManipEnv() as env:
         monkeypatch.setattr(env, "get_obs", fail)
-        brain = SimpleNamespace(name="test")
+        brain = SimpleNamespace(name="vista", begin_episode=lambda *a: None,
+                                abort_episode=lambda *a: None)
         with pytest.raises(failure):
             run_collect.run_episode(env, brain, [], "test", tmp_path / "ep_test")
     assert len(closed) == len(config.REC_CAMS)
