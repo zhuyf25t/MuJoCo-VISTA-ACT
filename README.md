@@ -1,6 +1,6 @@
 # MuJoCo · VISTA
 
-让视觉模型通过车头相机控制移动机械臂，在 MuJoCo 中完成捡球、搬运和投放，并记录可回放的操作轨迹。当前只维护 VISTA 这一条决策路线；长远目标是把成功示范整理成模仿学习数据，再验证学习策略和实机迁移。训练、数据集导出和实机接入尚未实现。
+让视觉模型通过车头相机控制移动机械臂，在 MuJoCo 中完成捡球、搬运和投放。采集器记录执行前图像与实测状态、随后施加的动作，完整成功集自动导出 ACT HDF5，并持续追加 manifest。当前只维护 VISTA 这一条示范路线；ACT 网络、训练和实机接入尚未实现。
 
 ## 当前结构
 
@@ -10,12 +10,12 @@ control/           底盘、两自由度机械臂、夹爪控制
 sim/               MuJoCo 场景与机器人封装
 models/            当前使用的四个 XML 模型文件
 tests/             VISTA、控制与回放测试
-act.md             ACT 数据接口、模型与训练设计（尚未实现）
+act.md             已实现的数据接口，以及待实现的 ACT 模型与训练设计
 assets/act/        ACT 设计配图
 run_collect.py     采集入口，默认 VISTA、1 个 episode
 hal.py             仿真硬件接口
 config.py          物理参数、相机、频率与路径
-recorder.py         决策日志、控制轨迹和图像记录
+recorder.py         原始记录、成功集 HDF5、manifest 与崩溃恢复
 playback.py         历史状态回放
 replay_gui.py       回放窗口与轨迹校验
 rerender.py         从轨迹重新生成录像
@@ -54,6 +54,7 @@ Linux / WSL 可使用 `./run`；第一次运行会通过 `uv` 创建环境并安
 - `--no-images`：关闭通用采集图像；VISTA 仍保存必需的车头 PNG。
 - `--out <目录>`：通用采集记录目录，默认 `data/episodes/`。
 - `--brain-memory <目录>`：VISTA 图片、笔记和调用日志目录，默认 `output/vista/`。
+- `--dataset-out <目录>`：HDF5 和单个 `manifest.json` 的根目录，默认 `data/act_v1/`；多次运行追加，不重置。采集阶段不划分训练集/验证集。
 
 原来的 `--brain=vista` 仍可使用，其余 brain 选项已移除。
 
@@ -63,7 +64,45 @@ VISTA 用 `play` 交出一批动作；采集器按顺序执行后，将批次回
 
 肩、肘实测角可见，但单关节 `shoulder` / `elbow` 微调暂时禁止；手臂只通过 `arm_pose` 的四种预设运动。提示词、模型动作 Schema 和批次校验共同执行这项限制，底层控制能力仍保留。
 
-正常结束后继续仿真并采集 3 秒，再进行环境判定。模型自评与环境成功标志分别保存。`data/episodes/` 保存通用轨迹和录像图片，`output/vista/` 保存图片证据、消息、调用日志、每集草稿及跨集指南；下次运行时会自动创建这些目录。VISTA 的 `frame_index.jsonl` 为每张原图保存采样时间 `timestamp_s` 和实测状态 `observation`。`actions.jsonl` 在批次结算时追加一条记录，`observation` 只存该批执行前的五维实测状态，与 `before_frame_id` 对应；保留前后帧编号，不展开第二组执行后状态。`history` 查询已结算批次；`inspect` 按 `frame_id` 查询已归档图片，因此当前图即使没有对应的动作记录也可查看。控制拍级 ACT 数据的时间对齐与导出仍待实现。
+正常结束后继续仿真并采集 3 秒，再进行环境判定。模型自评与环境成功标志分别保存。`data/episodes/` 保存通用轨迹和录像图片，`output/vista/` 保存图片证据、消息、调用日志、每集草稿及跨集指南；下次运行时会自动创建这些目录。VISTA 的 `frame_index.jsonl` 为每张原图保存采样时间 `timestamp_s` 和实测状态 `observation`。`actions.jsonl` 在批次结算时追加一条记录，`observation` 只存该批执行前的五维实测状态，与 `before_frame_id` 对应；保留前后帧编号，不展开第二组执行后状态。`history` 查询已结算批次；`inspect` 按 `frame_id` 查询已归档图片，因此当前图即使没有对应的动作记录也可查看。
+
+## 采集、HDF5 与 manifest
+
+新控制录像直接渲染 320×240 RGB 并保存无损 PNG（车头与辅助俯视图均使用此尺寸）。每拍在物理推进前采样，再执行 0.1 秒，成功执行完这一拍才追加并刷盘 `trajectory.jsonl`。每行 `state` 是实测肩、肘、连续夹爪开度、前向速度、转向速度；`action` 是肩肘目标、二值夹爪目标、限幅后的底盘目标速度。原始 `t/t_end` 仅用于检查执行区间，`qpos/qvel/ctrl` 留作仿真诊断。最终观测单独保存在 `terminal.json`，回放会读取它，训练不会给它伪造动作。
+
+一集正常结束且最终环境判定成功，即整集入选；保留全部控制拍，包括静止、纠错和收尾等待，不做行为质量打分或片段裁剪。仍会检查图片可读、形状正确、数值有限和控制拍连续，防止损坏的数据被当成训练数据。失败或中断仅排除出训练候选集，原始记录不删除；`--no-images` 是诊断模式，即使任务成功也不导出 HDF5。
+
+普通任务失败（包括模型主动结束但环境未成功、耗尽 `--max-decisions`）不会终止多集采集；结算失败集后继续下一个 seed。已知的机械臂到位超时或卡住会返回 `failed, action_applied=true`：停止当前批次的剩余动作，接回新观察，让 VISTA 继续决策。全部请求的集数完成后，只要有失败，命令最终返回退出码 1，这不表示在首个失败处提前停止。模型请求异常、文件写入异常、控制器执行进度未知等运行错误仍会停止；关闭 GUI 也会提前结束。
+
+每个入选 episode 在 `--dataset-out` 下得到一个 `episodes/episode-0000.h5`，含三个数组：
+
+```text
+/observations/images/front  uint8   [T, 240, 320, 3]
+/observations/state         float32 [T, 5]
+/action                     float32 [T, 5]
+```
+
+图像像素直接打包在 HDF5 中，使用无损分块压缩；没有 `/timestamp`、`/source_step`，状态和动作保留物理单位、不提前归一化。`T = action.shape[0]`，也写入文件属性和 manifest 的 `num_steps`。这是本项目面向 ACT 的格式，不是原版 ACT loader 的直接替代。以后 Dataset 负责通道转换、归一化和未来动作块抽取。
+
+每个数据集目录只有一个 manifest，顶层为 `schema` 和 `episodes`。每个 episode 记录独立身份、源目录、seed、状态、是否入选、HDF5 路径、T 和原因。原始目录/VISTA 目录的局部编号无需相同，manifest 保存原始路径，原始 meta 保存 VISTA 路径；不同采集目录中的同名 `ep_0000` 不会覆盖同一个 HDF5。`selected_for_dataset=true` 表示合格候选；**现在不保存 train/val 归属、不自动划分**，准备训练时冻结清单并按 episode/场景分组划分。
+
+```powershell
+.\.venv-gui\Scripts\python.exe run_collect.py --gui --episodes 5 --seed 0 --out data/episodes/run_001 --brain-memory output/vista/run_001 --dataset-out data/act_v1
+```
+
+再次使用相同 `--dataset-out` 会继续追加清单和 HDF5 编号；指定新目录才是新数据集。默认 seed 每次从 0 开始，若要新场景，后续命令应显式改变 `--seed`。原始目录预留和 manifest 更新采用本地文件锁，避免多个进程覆盖或丢失条目；并发 VISTA 任务建议使用各自的 `--brain-memory`，避免共享并改写同一份 guide。
+
+## 中断与恢复
+
+在首次动作前，先在 manifest 登记 `status=recording, selected_for_dataset=false, h5=null`。原始 JSONL 每拍追加并 flush/fsync；每集结束才读改写 manifest，使用临时文件、fsync、原子替换，保持旧条目。成功 HDF5 也先写临时文件，完整关闭并发布后才将 manifest 改成 `ready` 和入选。
+
+强制杀进程、崩溃或断电时，不会保证调用 Python 收尾代码。半集从开始就处于排除状态，不能依靠 finally 才排除。下次采集自动检查尚未结算的条目：正在运行的源目录仍有进程锁，因此跳过；已停止且没有完整结果的标为 `interrupted`；已经写下完整成功结果、只差导出/更新清单的则恢复发布，不重复创建条目。可单独恢复，不调用模型：
+
+```powershell
+.\.venv-gui\Scripts\python.exe recorder.py --dataset-out data/act_v1
+```
+
+此前完成的成功集不受后一集崩溃影响；半集保留已完成且刷盘的控制拍，正在执行或尚未刷完的一拍不保证完整，整个半集不会导出为训练数据。断电后的存储介质可靠性仍取决于操作系统与磁盘，不能承诺零字节丢失。
 
 当前已实现采集与回放闭环；真实模型的视觉判断、抓球稳定性和成功率仍需单独验证。
 

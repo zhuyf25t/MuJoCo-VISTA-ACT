@@ -14,6 +14,14 @@ from hal import RobotInterface, TickCallback
 from .kinematics import PlanarArm2R
 
 
+class ActionFailed(Exception):
+    """A commanded motion finished its attempt but did not reach its target.
+
+    All executed ticks completed normally. The command was applied; this is
+    recoverable from a fresh observation, unlike an exception during a tick.
+    """
+
+
 def wrap_angle(a: float) -> float:
     return (a + np.pi) % (2 * np.pi) - np.pi
 
@@ -96,14 +104,14 @@ class ArmDriver:
             q_cmd = np.clip(q_goal, q_cmd - rate, q_cmd + rate)
             self.r.command_arm(q_cmd)
             if self.r.now() - t0 > timeout:
-                return False, f"臂移动超时 (目标 {np.round(q_goal, 2)})"
+                raise ActionFailed(f"臂移动超时 (目标 {np.round(q_goal, 2)})")
             self.r.tick(on_tick)
         # The ramp tolerance must not discard a small nudge or its final remainder.
         self.r.command_arm(q_goal)
         self.r.step_ticks(3, on_tick)
         err = float(np.linalg.norm(self.r.arm_q - q_goal))
         if err > 0.35:
-            return False, f"臂被卡住 (残差 {np.degrees(err):.0f}°)"
+            raise ActionFailed(f"臂被卡住 (残差 {np.degrees(err):.0f}°)")
         return True, f"臂到位 (残差 {np.degrees(err):.0f}°)"
 
     def move_pose(self, pose: str, on_tick: TickCallback | None = None) -> tuple[bool, str]:

@@ -127,11 +127,25 @@ class MjRobot(RobotInterface):
         rng = self.model.actuator_ctrlrange[self.i_act_fi]
         return float(rng[0]), float(rng[1])
 
+    @property
+    def applied_action(self) -> np.ndarray:
+        # MuJoCo may clamp actuator inputs even when data.ctrl is out of range.
+        ctrl = self.data.ctrl.copy()
+        limited = self.model.actuator_ctrllimited.astype(bool)
+        ctrl[limited] = np.clip(ctrl[limited], self.model.actuator_ctrlrange[limited, 0],
+                                self.model.actuator_ctrlrange[limited, 1])
+        lo, hi = self.finger_ctrl_range()
+        left, right = ctrl[self.i_wl], ctrl[self.i_wr]
+        return np.array([*ctrl[self.i_act_arm], (hi - ctrl[self.i_act_fi]) / (hi - lo),
+                         0.1 / 2 * (left + right), 0.1 / 0.42 * (right - left)])
+
     # ================= 时间 =================
     def now(self) -> float:
         return float(self.data.time)
 
     def tick(self, on_tick: TickCallback | None = None) -> None:
+        if self.before_tick is not None:
+            self.before_tick()
         for _ in range(STEPS_PER_CTRL):
             mujoco.mj_step(self.model, self.data)
             self._auto_grasp()

@@ -4,7 +4,7 @@
 
 **我们要训练的是：输入车头图像和机器人实测状态，一次预测未来一段底层控制目标的 ACT 策略。** VISTA 负责产生示范；ACT 学习示范，部署后直接通过 HAL 逐拍控制机器人。
 
-这份文档是实现蓝图，包含网络图、数据契约和教学版训练代码。仓库目前已有 VISTA、控制、仿真、采集与回放；**ACT 数据导出、模型、训练和部署模块尚未落地**。本次只新增本文和配图，不改你的 VISTA 或控制运行代码。你负责给 VISTA 接入本体状态；双方应共用下面定义的观测语义。
+本文包含已实现的数据采集契约，以及尚未落地的 ACT 网络、训练和部署蓝图。VISTA 已接入五维本体状态；`recorder.py` 已实现执行前采样、完整成功集 HDF5、持续追加的 manifest 和崩溃恢复。第 8 节仍是教学代码，未进行 PyTorch 训练验证。
 
 推荐阅读顺序：先看第 1、3、6 节的图，再看第 4～5 节的数据，最后看第 8 节的代码。
 
@@ -18,8 +18,8 @@
 
 1. VISTA 看图像和状态，提出高层动作；现有 `control/` 把动作展开为每个控制拍的底层命令。
 2. 采集器记录执行前观测、随后的实际施加命令、时间和结果，保留所有原始 episode。
-3. 检查程序生成 `manifest.json`，分别判定数据是否完整、任务是否成功、示范是否适合学习。
-4. 导出选中的 episode 为 HDF5；整集划分训练集和验证集；只用训练集计算归一化统计量。
+3. 采集开始先登记排除条目；完成后依据完整性与最终环境成功判定更新 `manifest.json`。不做行为质量评分，不裁剪片段。
+4. 每个完整成功 episode 立即导出一个 HDF5。采集阶段不划分 train/val；准备训练时冻结数据集，按 episode/场景划分，再仅用训练集计算统计量。
 5. Dataset 从某集抽取时刻 `t`，得到 `o_t` 和未来 `K` 拍动作块，训练 ACT。
 6. 部署时输入新观测，预测动作块，取当前拍的动作，通过 HAL 执行一拍，再取新观测。
 
@@ -60,13 +60,11 @@ mujoco/
 ├── sim/                         已有：MuJoCo 后端与环境
 ├── models/                      已有：当前场景和机器人 XML
 ├── config.py                    已有：频率、相机、控制参数
-├── recorder.py                  已有：需补执行前采样与明确的动作时序
+├── recorder.py                  已有：执行前采样、HDF5、manifest、崩溃恢复
 ├── run_collect.py               已有：VISTA 采集入口
 ├── playback.py / replay_gui.py   已有：回放与轨迹检查
 ├── act/                         新增：与 VISTA 分离的训练包
 │   ├── schema.py                字段、维度、单位、顺序、控制频率
-│   ├── validate.py              检查所有原始 episode，输出筛选报告
-│   ├── export.py                导出 HDF5，保持原 episode_id
 │   ├── dataset.py               读取、抽取动作块、补齐和归一化
 │   ├── model.py                 CNN + CVAE + 策略 Transformer
 │   ├── train.py                 训练、验证、checkpoint
@@ -80,10 +78,9 @@ mujoco/
 │   │   ├── decisions.jsonl
 │   │   └── imgs/
 │   └── act_v1/                  可重建、带版本的数据集
-│       ├── schema.json
-│       ├── manifest.json
-│       ├── stats.json
-│       └── episodes/ep_0000.h5
+│       ├── manifest.json        已有：schema + episodes，采集时无 split
+│       ├── stats.json           未来训练时才生成
+│       └── episodes/episode-0000.h5
 ├── output/
 │   ├── vista/ep_0000/           VISTA 图片、调用、笔记与决策审计
 │   └── act/exp_001/             训练日志、配置、指标、best.pt
@@ -92,9 +89,9 @@ mujoco/
 
 以后根目录 `run.py` 只做参数解析和调度，不塞入网络定义。可设计为 `collect / validate / export / train / evaluate` 五个子命令。**这些子命令现在还不能运行。** 不必为设计文件一次性创建所有空模块。
 
-`episode_id` 应由最外层采集任务分配一次，同时传给通用记录器和 VISTA。当前两个目录分别扫描自己的最大编号再加一，所以即使从空目录开始，也不能保证以后永远相同。异常、删除和中断都可能导致编号偏移。
+数据集在 manifest 锁内分配唯一的 `episode-XXXX` 编号，不依赖原始目录和 VISTA 的局部编号。每条清单保留 `source_uid` 和原始绝对目录，原始 meta 保留数据集编号及完成后的 VISTA 目录。多次命令或多个原始目录可以追加到同一个 `--dataset-out`，不会因为局部同名 `ep_0000` 覆盖训练文件。
 
-一集是从环境 reset 到结束的完整任务；VISTA 的决策轮次属于这一集内部。VISTA 稀疏的决策图片编号，也不等于控制级 `control_step`。不同采集批次合并时，使用 `run_id + episode_id` 避免重名；清洗后保留源编号，不重新从零编号。
+一集是从环境 reset 到结束的完整任务。VISTA 批次和图片编号用于复盘，不是 ACT 的控制拍编号；ACT 动作块可以跨连续的 VISTA 批次边界，但不能跨 episode。
 
 ## 4. 先固定数据的物理含义
 
@@ -126,7 +123,7 @@ mujoco/
 | 3 | 底盘实测前向速度 `v_measured` | m/s | 前向目标速度 `v_cmd` | m/s |
 | 4 | 底盘实测转向角速度 `w_measured` | rad/s | 目标转向角速度 `w_cmd` | rad/s |
 
-这是目标 5 维状态 / 5 维动作契约。**五维状态已接入 VISTA 的批次边界观测；控制拍级动作标签与 ACT 数据导出尚待实现。** HAL 的 `base_velocity` 现在提供车体坐标系下的实测 `[v,w]`，仿真后端从当前物理状态读取。`env.get_obs()` 提供带单位名称的 `observation` 和 `timestamp_s`，VISTA 按原图编号保存。真机仍需实现反馈接口，并明确来源、滤波和延迟；不能用目标速度或未来位置差分制造训练时有、部署时没有的观测。
+这是目标 5 维状态 / 5 维动作契约。**五维实测状态已同时接入 VISTA 及逐控制拍记录；施加目标与成功集 HDF5 已实现。** HAL 的 `base_velocity` 现在提供车体坐标系下的实测 `[v,w]`，仿真后端从当前物理状态读取。`env.get_obs()` 提供带单位名称的 `observation` 和 `timestamp_s`，VISTA 按原图编号保存。真机仍需实现反馈接口，并明确来源、滤波和延迟；不能用目标速度或未来位置差分制造训练时有、部署时没有的观测。
 
 目前 `base_pose` 虽在接口注释中写作里程计，MuJoCo 实现实际直接读取世界位姿。用它差分调通仿真不等于已经验证了真机里程计。更不能拿 `v_cmd/w_cmd` 填进 `v_measured/w_measured`。
 
@@ -149,116 +146,73 @@ a_t = [shoulder_target, elbow_target, g_target, v_cmd, w_cmd]
 
 `g_actual = clip(1 - finger_slide_actual / 0.05, 0, 1)` 是归一化开合比例，并不是以米表示的两指净间距。当前 0.05 m 对应闭合目标，0 m 对应全开目标；方向不要写反。
 
-### 4.4 最优先修正：观测和动作的时间对齐
+### 4.4 已实现：执行前观测与随后施加动作
 
-训练样本必须表示：**看到 `o_t` 以后，在区间 `[t, t+0.1s)` 施加 `a_t`。**
+`MjRobot.tick()` 在命令已设置、物理尚未推进时调用 `before_tick`。记录器同步采样图片和五维实测状态，并读取限幅后的最终目标；物理执行 50 个子步后，`on_tick` 将完整的 `(o_t,a_t)` 追加到原始 JSONL 并 flush/fsync。GUI 刷新仍在执行后。臂原语内部的插值和停车/夹爪等待拍都会记录。
 
-```text
-时刻 t                         时刻 t+0.1s
-读 I_t、s_t                    读 I_(t+1)、s_(t+1)
-确定并记录 a_t                 确定并记录 a_(t+1)
-       └── 保持 a_t，推进 50 个物理步 ──┘
-```
+原始行中的 `t` 是执行前时刻，`t_end` 是执行完成时刻；`frame` 从零递增。这些只用于检查和回放，不输入 ACT，不写入训练 HDF5。最终 `o_T` 独立保存在 `terminal.json`，供回放查看最终状态，不伪造 action。控制拍未完整执行就发生异常时，不把该拍提交为有效样本。
 
-当前 `MjRobot.tick()` 先推进物理，再调用 `on_tick`。因此当前轨迹同一行中的图片/状态更接近 `o_(t+1)`，`ctrl` 则是刚刚施加的 `a_t`。**不要直接把同一行二者当作标准的 `(o_t,a_t)` 训练。**
+旧版记录是执行后采样，并且缺少逐拍实测速度。新导出器不会静默把它们当作新契约数据；本版正式采集应重新生成完整轨迹。
 
-新采集建议在物理推进之前，获取同一时刻的图像和实测状态，同时读取即将施加的最终命令；保存初始观测和独立的终止观测。可以给采集层/HAL 包装器增加 pre-step hook，保留已有控制原语。按 VISTA 决策次数记录不足以覆盖原语内部的每一拍。
+## 5. 数据保存、筛选和训练读取
 
-旧记录在确认每行代表完整控制区间、没有漏帧且命令保持语义一致后，可以尝试配对“上一行观测 + 下一行命令”，但会失去最初观测，必须单独标注转换规则并回放验证。新一轮采集直接修正时序更清楚。
+### 5.1 原始记录与每集 HDF5
 
-## 5. 数据怎么保存、清洗和送入训练
-
-### 5.1 原始数据与训练数据各司其职
-
-原始 `data/episodes/` 保留全量，包括失败和中断。`output/vista/` 用于追溯 VISTA 如何决策；ACT 图像来自控制级记录，不能用决策级稀疏图片替代 10 Hz 图像。
-
-建议原始轨迹每行显式带 `control_step`、观测时间、命令生效时间、图像路径、`state`、请求命令、施加命令。`meta.json` 保存任务、seed、频率、机器人模型版本/哈希、控制参数、相机参数、schema 版本、停止原因和结果。跨真机与仿真时还需明确时钟来源和传感器延迟。
-
-一集导出一个 `.h5`，字段如下。`T` 是有效动作区间数，而不是 VISTA 决策次数。
+原始记录默认在 `data/episodes/`，VISTA 记忆默认在 `output/vista/`，数据集默认在 `data/act_v1/`。分别由 `--out`、`--brain-memory`、`--dataset-out` 指定。车头及辅助录像直接渲染为 320×240 RGB PNG；HDF5 只包含车头图。数据集文件保存真实像素，而不是外部图片路径。
 
 ```text
-ep_0000.h5
-  attributes:
-    schema_version = "mobile_act_v1"
-    episode_id = "ep_0000"
-    task = "pick_balls_into_bin"
-    fps = 10
-    source_hash = "..."
-  /timestamp                     float64 [T]             执行动作前的仿真时间
-  /source_step                   int64   [T]             原始控制拍编号
-  /observations/state            float32 [T, Ds]          未归一化、物理单位
-  /observations/images/front     uint8   [T, 240, 320, 3]  RGB
-  /action                        float32 [T, Da]          未归一化、最终施加目标
+episodes/episode-0000.h5
+  attributes: episode_id, source_uid, num_steps, fps, schema_version, schema_json
+  /observations/images/front  uint8   [T, 240, 320, 3]
+  /observations/state         float32 [T, 5]
+  /action                     float32 [T, 5]
 ```
 
-终止后的 `o_T` 没有对应的新动作，可另外保存在原始数据或独立 terminal group，**不要给它伪造全零 action**。全零向量本身也可能是合法动作，不能当“数据不存在”的标记。
+`T = action.shape[0]`，也保存为文件属性和 manifest 的 `num_steps`。不保存 `/timestamp`、`/source_step`；完整逐帧保留，不做掐头去尾或中间删帧。静止、纠错、接触等待与 3 秒收尾都保留。终止观测留在原始记录中。
 
-图像统一为 RGB、240×320；首版不做随机裁剪，避免裁掉抓取对象。实际相机键 `front_cam` 在导出时映射为 `front`，并写入 schema。图像可以用 HDF5 分块压缩，状态/动作不要提前标准化。此处是自定义 HDF5 格式，借鉴[原 ACT 的记录方式](https://github.com/tonyzhaozh/act/blob/main/record_sim_episodes.py)；原 loader 读取的是 `observations/qpos` 等字段，不能直接不改路径就复用。它也不是 LeRobot v3 的原生目录格式，未来接入时再写转换器。
+图像使用 HDF5 分块无损压缩，状态和动作保持原始物理单位。这是本项目面向 ACT 的格式，原 ACT loader 的 `observations/qpos`、文件命名和机器人维度不同，不能直接复用。未来 Dataset 完成 `[H,W,3] → [3,H,W]`、图像预处理、state/action 归一化、动作块抽取和 padding；不在采集时固定动作块长度。
 
-`schema.json` 示例：
+### 5.2 每个数据集一个 manifest；采集阶段不划分 train/val
+
+manifest 的顶层是 `schema` 和 `episodes`。schema 保存字段顺序、单位、10 Hz、相机/尺寸与执行前采样约定，不另生成一份 schema.json。示意如下（省略部分 schema 和追溯字段）：
 
 ```json
 {
-  "version": "mobile_act_v1",
-  "fps": 10,
-  "observation_timing": "before_action",
-  "state_names": ["shoulder_actual", "elbow_actual", "gripper_actual", "base_v_measured", "base_w_measured"],
-  "state_units": ["rad", "rad", "ratio", "m/s", "rad/s"],
-  "action_names": ["shoulder_target", "elbow_target", "gripper_target", "base_v_cmd", "base_w_cmd"],
-  "action_units": ["rad", "rad", "ratio", "m/s", "rad/s"],
-  "gripper": {"closed": 0, "open": 1},
-  "cameras": ["front"],
-  "image_shape": [240, 320, 3],
-  "image_color": "RGB",
-  "image_normalization": "imagenet",
-  "action_semantics": "applied_target_held_for_one_control_interval"
+  "schema": {"version": "mobile_act_v1", "fps": 10},
+  "episodes": [
+    {
+      "episode_id": "episode-0000",
+      "status": "ready",
+      "selected_for_dataset": true,
+      "success": true,
+      "num_steps": 356,
+      "h5": "episodes/episode-0000.h5",
+      "reason": null
+    },
+    {
+      "episode_id": "episode-0001",
+      "status": "recording",
+      "selected_for_dataset": false,
+      "success": null,
+      "num_steps": null,
+      "h5": null,
+      "reason": "not_finalized"
+    }
+  ]
 }
 ```
 
-### 5.2 清洗是生成选择结果，不是删除历史
+每集第一次动作前即登记 `recording` 且排除；整集正常结束、最终环境判定成功、字段和图像完整可读、控制拍连续时才发布 HDF5 并标记 `ready`。模型自评不替代环境结果。失败为 `rejected`，中断为 `interrupted`，数据结构检查不通过为 `invalid`，导出 I/O 异常为 `export_error`；这些状态都不入选，源数据保留。不增加示范行为质量评分。
 
-建议 `validate.py` 对全部 episode 生成如下清单。这里 `manifest.json` 是一个 JSON 数组；`export_file` 相对 `data/act_v1/`。
+普通失败不终止多集采集：最终未成功或决策轮数耗尽后，继续下一个 seed。机械臂卡住、到位超时等已知动作失败只取消本批剩余动作，记录 `failed, action_applied=true` 并取得新观察，允许 VISTA 在本集继续恢复；这些已执行控制拍仍按实际施加目标保存。如果最终成功，整集（含恢复动作）仍可入选。真正的运行异常、未知执行进度或用户关闭窗口才提前停止采集。
 
-```json
-[
-  {
-    "episode_id": "ep_0000",
-    "data_valid": true,
-    "task_success": true,
-    "quality_review": "accepted",
-    "selected_for_training": true,
-    "split": "train",
-    "num_steps": 580,
-    "export_file": "episodes/ep_0000.h5",
-    "reasons": []
-  },
-  {
-    "episode_id": "ep_0001",
-    "data_valid": true,
-    "task_success": false,
-    "quality_review": "rejected",
-    "selected_for_training": false,
-    "split": null,
-    "num_steps": 630,
-    "export_file": null,
-    "reasons": ["task_failed"]
-  }
-]
-```
+多次使用相同 `--dataset-out` 会追加条目，不重置文件或已有条目。manifest 更新在文件锁内执行：读取旧内容、增加或更新条目、写临时 JSON、fsync、原子替换。不会每拍导入导出整份清单；原始 JSONL 才逐拍追加并刷盘。每集成功即导出，不等所有 episode 完成。
 
-检查应至少分成三层：
+强制退出时不能依赖 Python 的 finally。采集中的条目从开始就是 `selected_for_dataset=false`，所以硬崩溃后也不会被训练读取。下次采集自动恢复，也可执行 `python recorder.py --dataset-out data/act_v1`：跳过仍持有源目录进程锁的活动集；将没有完整结果的半集标为 `interrupted`；已经保存完整成功结果但发布中断的，幂等恢复 HDF5/清单更新。此前已完成的成功集不受影响，当前未刷盘的一拍不能保证完整。文件锁面向本机磁盘，断电后的实际持久性仍受存储系统影响。
 
-| 层次 | 检查内容 | 处理方式 |
-| --- | --- | --- |
-| 数据有效 | 文件可读、字段齐全、数值有限、图片存在、长度一致、时间严格递增且约 0.1 s、初始状态和动作时序正确 | 损坏/错位不能凭任务成功放行。 |
-| 任务成功 | 环境最终判定、稳定等待后的结果、是否完整结束；VISTA 自评单独保留 | 当前环境判定与示范质量不是一回事。 |
-| 示范质量 | 大量无效等待、重复抖动、不合理命令跳变、异常碰撞、任务捷径、回放人工抽查 | 首版选择完整、成功、质量合格的示范。 |
+采集阶段没有 `split` 字段或 `--split` 参数。将来准备训练时，冻结 manifest，再按整集和场景分组添加 train/val 划分；同 seed 的重复示范不能随意分到两边。第 8 节代码因此需要一份已经划分的清单，不能直接对刚采集的清单开始训练。
 
-成功不自动等于优质，例如通过推球碰巧完成入箱，未必是想教给 ACT 的抓取策略。失败也不意味着永久没价值：失败轨迹用于诊断，成功轨迹中的合理纠错动作有助于覆盖偏离状态。首版行为克隆先用经过筛选的成功完整示范，之后再考虑独立标注的恢复片段。
-
-不要把中间坏帧删掉后拼成连续轨迹。若确实按片段切分，要保存起止控制拍、把每段当作独立连续序列，并让同一原始 episode 的所有片段进入同一 split。长时间静止可做有规则的尾段裁剪或采样权重调整，不能随意压缩物理时间；夹爪闭合的中间过程、接触等待也不能一律删掉。
-
-训练/验证按整集划分，首版可用约 80%/20%，数据很少时更要防止相邻帧随机拆分。若同一场景种子重复采集，也应按场景分组防止泄漏。闭环测试另用未参加选模型的种子。清洗规则版本、源文件哈希和 split 应冻结保存。
+`--seed` 默认 0，多集依次使用 `seed+i`。它控制小车初始 x/y 扰动（标准差 0.03 m）、四球位置（x 0.45～1.75 m、y -1.30～1.30 m，有间距约束）以及球的质量和摩擦系数（约 ±20%）。箱子、相机和初始臂姿固定。再次启动默认又从 seed=0 开始；如需新场景应显式更改 seed。相同 seed 在相同代码配置下复现随机化设置，不保证大模型动作完全相同。
 
 ### 5.3 一个训练样本到底是什么
 
@@ -365,7 +319,7 @@ L_total = L_action + beta * KL
 
 下面的 Python 代码块按顺序拼接可组成一个教学模块；真正落地时再拆到第 3 节的文件。它展示了完整的主要计算路径，**不是已经完成工程验证的训练框架**。
 
-依赖为 PyTorch、torchvision、NumPy、h5py。本文编写环境没有安装 PyTorch/h5py，所以只做语法与静态一致性检查，没有运行前向、反向或训练；本次不为文档安装训练环境。省略了 CLI、多进程数据缓存、断点恢复入口、AMP、分布式训练和完整的原始 JSONL 导出实现。
+训练示例依赖 PyTorch、torchvision、NumPy、h5py。h5py 已用于正式采集导出；下列网络和训练代码仍仅是教学示例，尚未运行前向、反向或训练。示例省略 CLI、多进程数据缓存、断点恢复入口、AMP 和分布式训练。
 
 示例假定 HDF5 已按照前述 schema 正确导出，manifest 中已有非空 train/val 两组，且五维实测状态接口已补齐。否则应先使用单独的三维状态版本，不能用假的测量凑数。
 
@@ -413,10 +367,8 @@ def read_json(path):
 
 
 def selected_entries(manifest, split):
-    return [e for e in manifest if e["selected_for_training"]
-            and e["data_valid"] and e["task_success"]
-            and e["quality_review"] == "accepted"
-            and e["split"] == split]
+    return [e for e in manifest["episodes"] if e["selected_for_dataset"]
+            and e["status"] == "ready" and e.get("split") == split]
 
 
 def compute_stats(root, train_entries):
@@ -427,7 +379,7 @@ def compute_stats(root, train_entries):
     for name, key in (("state", "observations/state"), ("action", "action")):
         n, total, total_sq = 0, None, None
         for entry in train_entries:
-            with h5py.File(Path(root) / entry["export_file"], "r") as f:
+            with h5py.File(Path(root) / entry["h5"], "r") as f:
                 x = np.asarray(f[key], dtype=np.float64)
             if x.ndim != 2 or not len(x) or not np.isfinite(x).all():
                 raise ValueError(f"Invalid {key}: {entry['episode_id']}")
@@ -447,7 +399,7 @@ def compute_stats(root, train_entries):
 class EpisodeDataset(Dataset):
     def __init__(self, root, entries, stats, cfg):
         self.cfg = cfg
-        self.paths = [Path(root) / e["export_file"] for e in entries]
+        self.paths = [Path(root) / e["h5"] for e in entries]
         self.stats = {k: np.asarray(v, dtype=np.float32) for k, v in stats.items()}
         self.index = []
         for ep_idx, path in enumerate(self.paths):
@@ -696,7 +648,7 @@ def train(dataset_root, experiment_dir, cfg=None, epochs=100, seed=42):
         torch.cuda.manual_seed_all(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     manifest = read_json(root / "manifest.json")
-    schema = read_json(root / "schema.json")
+    schema = manifest["schema"]
     if (len(schema["state_names"]) != cfg.state_dim
             or len(schema["action_names"]) != cfg.action_dim
             or tuple(schema["cameras"]) != cfg.cameras
@@ -733,7 +685,7 @@ def train(dataset_root, experiment_dir, cfg=None, epochs=100, seed=42):
                   "beta": beta, "batch_size": 8, "fps": schema["fps"]}
     (out / "config.json").write_text(json.dumps(run_config, indent=2), encoding="utf-8")
     manifest_hash = hashlib.sha256((root / "manifest.json").read_bytes()).hexdigest()
-    schema_hash = hashlib.sha256((root / "schema.json").read_bytes()).hexdigest()
+    schema_hash = hashlib.sha256(json.dumps(schema, sort_keys=True).encode()).hexdigest()
     for epoch in range(epochs):
         model.train()
         for batch in train_loader:
@@ -890,9 +842,9 @@ def rollout(model, robot, read_observation, stats, max_steps=600,
 
 | 阶段 | 要做的事 | 进入下一阶段的依据 |
 | --- | --- | --- |
-| 1：固定契约 | 你接入 VISTA 的 `o_t`；共同固定 state/action 的字段、单位和可用测量 | VISTA 与 ACT 使用相同含义的测量；不存在目标冒充反馈。 |
-| 2：修采集 | 统一 episode_id；加入执行前采样和施加命令记录；保留终止观测 | 回放能逐拍确认看见什么、随后施加什么。重点核对起步、转向、开闭爪切换。 |
-| 3：小量导出 | 先用少量完整 episode 打通检查、manifest、HDF5、Dataset | 随机抽一个样本，图像、状态、未来动作块与原回放一致；补齐不参与损失。 |
+| 1：固定契约（已接入） | VISTA 与逐拍采集共用五维实测状态；施加目标单独保存 | VISTA 与 ACT 使用相同含义的测量；不存在目标冒充反馈。 |
+| 2：采集（已实现） | 执行前采样、施加命令、终止观测、PNG、逐拍刷盘 | 回放能逐拍确认看见什么、随后施加什么。重点核对起步、转向、开闭爪切换。 |
+| 3：数据导出（已实现）与后续 Dataset | 整集成功筛选、HDF5、追加 manifest、崩溃恢复；后续实现训练 Dataset | 随机抽一个样本，图像、状态、未来动作块与原回放一致；补齐不参与损失。 |
 | 4：训练冒烟验证 | 在少量示范上过拟合，确认损失和梯度有效 | 分别检查所有动作维度；`z=0` 验证可用；模型能复现基础动作。 |
 | 5：正式数据与闭环 | 扩大合格示范，固定训练/验证集，在新场景测试 | 用成功率、任务耗时、碰撞、夹爪切换、推理延迟评估，不能只看 loss。 |
 | 6：比较与迁移 | 比较 `K`、图像/状态组合、时间集成和夹爪方案；再设计真机后端 | 有对照结果支持选择；校准真实状态、命令、频率、相机和接触差异。 |
@@ -910,4 +862,6 @@ def rollout(model, robot, read_observation, stats, max_steps=600,
 - [Mobile ALOHA](https://mobile-aloha.github.io/resources/mobile-aloha.pdf)：移动底盘与机械臂混合动作的参考。
 - 若后续选用 LeRobot，请依据其 [ACT 文档](https://huggingface.co/docs/lerobot/act) 和 [Dataset v3 文档](https://huggingface.co/docs/lerobot/lerobot-dataset-v3) 单独适配，勿把本文 HDF5 目录直接当成原生数据集。
 
-本次交付：本文和三组 PNG/SVG 图。5 个 Python 代码块共 480 行通过拼接后的语法检查；2 个 JSON 示例可解析，15 个不同本地链接目标存在，图文件可读且已人工查看。另独立运行了 NumPy 时间集成和动作适配示例，检查同一目标时刻的聚合、合法零动作、夹爪滞回和轮速限幅。**未运行 PyTorch 前向/反向、未训练模型、未改变现有运行代码；训练效果与部署性能尚待验证。**
+最初文档交付：本文和三组 PNG/SVG 图。5 个 Python 代码块共 480 行通过拼接后的语法检查；2 个 JSON 示例可解析，15 个不同本地链接目标存在，图文件可读且已人工查看。另独立运行了 NumPy 时间集成和动作适配示例，检查同一目标时刻的聚合、合法零动作、夹爪滞回和轮速限幅。**未运行 PyTorch 前向/反向、未训练模型、未改变现有运行代码；训练效果与部署性能尚待验证。**
+
+当前采集实现的验证覆盖见 `tests/test_recorder.py` 和 `tests/test_vista.py`：执行前图像/状态/施加动作配对、完整成功集导出、多次与并发追加、进程硬退出、发布中断恢复以及真实 MuJoCo 脚本示范。训练框架仍未落地。

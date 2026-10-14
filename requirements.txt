@@ -15,8 +15,9 @@ python-dotenv==1.2.3
 langgraph==1.2.12
 langchain-core==1.6.5
 
-# JPEG observations and MP4 recording/replay (FFmpeg is a runtime plugin).
+# PNG observations, HDF5 datasets and MP4 replay (FFmpeg is a runtime plugin).
 Pillow==12.3.0
+h5py==3.16.0
 imageio==2.37.4
 imageio-ffmpeg==0.6.0
 

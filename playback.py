@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from itertools import chain
 from bisect import bisect_right
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,7 +30,10 @@ def trajectory_path(source: str, root: Path) -> Path:
 def load_trajectory(path: Path, model: mujoco.MjModel) -> list[Frame]:
     frames = []
     with path.open(encoding="utf-8-sig") as stream:
-        for line_number, line in enumerate(stream, 1):
+        # New records store pre-action frames; retain the final post-action pose.
+        terminal = path.with_name("terminal.json")
+        tail = [terminal.read_text(encoding="utf-8")] if path.name == "trajectory.jsonl" and terminal.is_file() else []
+        for line_number, line in enumerate(chain(stream, tail), 1):
             if not line.strip():
                 continue
             try:

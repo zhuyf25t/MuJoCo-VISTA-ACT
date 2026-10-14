@@ -588,16 +588,19 @@ def fake_environment():
         model = None
 
         def __init__(self):
-            self.data = SimpleNamespace(time=0, qpos=np.zeros(1), ctrl=np.zeros(4))
+            self.data = SimpleNamespace(time=0, qpos=np.zeros(1), qvel=np.zeros(1), ctrl=np.zeros(5))
             self.robot = SimpleNamespace(base=None, arm=None, base_pose=np.zeros(3),
-                                         arm_q=np.zeros(2), finger_opening=1.0,
-                                         hal=SimpleNamespace(tick=self.tick, command_drive=self.command_drive))
+                                         arm_q=np.zeros(2), finger_opening=1.0, base_velocity=np.zeros(2),
+                                         hal=SimpleNamespace(tick=self.tick, command_drive=self.command_drive,
+                                                             applied_action=np.array([0, 0, 1, 0, 0])))
 
         def command_drive(self, v, w):
             state["drive_commands"].append((v, w))
 
         def tick(self, on_tick=None):
             import config
+            if getattr(self.robot.hal, "before_tick", None):
+                self.robot.hal.before_tick()
             state["ticks"] += 1
             self.data.time += config.CTRL_DT
             if on_tick:
@@ -658,6 +661,88 @@ def test_collector_reuses_final_observation_and_finishes_without_new_frame(brain
     check_current_round_results(brain.state["messages"])
 
 
+@pytest.mark.parametrize("stop", ["finish", "decision_limit"])
+def test_unsuccessful_episodes_continue_with_next_seeds(brain_factory, monkeypatch, tmp_path, capsys, stop):
+    import run_collect
+    responses = ([finish(f"finish-{i}") for i in range(3)] if stop == "finish"
+                 else [play(f"play-{i}") for i in range(3)])
+    brain = brain_factory(responses, begin=False)
+    env, state = fake_environment()
+    seeds = []
+    original_reset = env.reset
+
+    def reset(**kwargs):
+        seeds.append(kwargs["seed"])
+        original_reset(**kwargs)
+
+    env.reset = reset
+    monkeypatch.setattr(run_collect, "MobileManipEnv", lambda: env)
+    monkeypatch.setattr(run_collect, "build_brain", lambda *a: brain)
+    monkeypatch.setattr(run_collect, "ToolLayer", lambda *a, **k: SimpleNamespace(
+        execute=lambda *a: (True, "ok"), schemas_anthropic=lambda: SCHEMAS))
+    code = run_collect.cli(["--episodes", "3", "--seed", "7", "--max-decisions", "1",
+                            "--no-images", "--out", str(tmp_path / "collector"),
+                            "--dataset-out", str(tmp_path / "dataset")])
+    assert code == 1  # Report unsuccessful collection only after all requested episodes.
+    assert state["resets"] == 3 and seeds == [7, 8, 9]
+    assert state["closed"] and brain.model.closed and len(brain.model.requests) == 3
+    manifest = json.loads((tmp_path / "dataset/manifest.json").read_text(encoding="utf-8"))
+    assert [entry["seed"] for entry in manifest["episodes"]] == seeds
+    assert all(entry["status"] == "rejected" and entry["reason"] == "task_failed"
+               and not entry["selected_for_dataset"] and entry["h5"] is None
+               for entry in manifest["episodes"])
+    assert not list((tmp_path / "dataset/episodes").glob("*.h5"))
+    assert capsys.readouterr().out.count("继续下一集") == 2
+
+
+def test_blocked_arm_recovers_without_stopping_collection(brain_factory, monkeypatch, tmp_path):
+    import run_collect
+    from control.drivers import ArmDriver
+    brain = brain_factory([play(actions=[{"action": "arm_pose", "args": {"pose": "drop"}},
+                                         {"action": "forward", "args": {"seconds": 1}}]),
+                           finish("finish-0"), finish("finish-1")], begin=False)
+    env, state = fake_environment()
+    hal = env.robot.hal
+    hal.arm_q = np.zeros(2)  # Simulate a mechanically blocked arm despite valid commands.
+    hal.arm_geometry = lambda: (1, 1, np.full(2, -3.0), np.full(2, 3.0))
+    hal.command_arm = lambda q: hal.applied_action.__setitem__(slice(0, 2), q)
+    hal.now = lambda: env.data.time
+    hal.step_ticks = lambda n, on_tick=None: [env.tick(on_tick) for _ in range(n)]
+    env.robot.arm = ArmDriver(hal)
+    monkeypatch.setattr(run_collect, "MobileManipEnv", lambda: env)
+    monkeypatch.setattr(run_collect, "build_brain", lambda *a: brain)
+    code = run_collect.cli(["--episodes", "2", "--no-images", "--out", str(tmp_path / "collector"),
+                            "--dataset-out", str(tmp_path / "dataset")])
+    assert code == 1 and state["resets"] == 2 and len(brain.model.requests) == 3
+    record = lines(tmp_path / "vista/ep_0000/actions.jsonl")[0]
+    assert record["execution_status"] == "failed"
+    assert [r["status"] for r in record["action_results"]] == ["failed", "not_executed"]
+    assert [r["action_applied"] for r in record["action_results"]] == [True, False]
+    assert "残差" not in json.dumps(record, ensure_ascii=False)
+    assert all(command == (0.0, 0.0) for command in state["drive_commands"])
+    manifest = json.loads((tmp_path / "dataset/manifest.json").read_text(encoding="utf-8"))
+    assert [entry["status"] for entry in manifest["episodes"]] == ["rejected", "rejected"]
+
+
+def test_arm_timeout_is_known_failure_but_tick_exception_stays_fatal():
+    from control.drivers import ActionFailed, ArmDriver
+    robot = SimpleNamespace(arm_q=np.zeros(2),
+                            arm_geometry=lambda: (1, 1, np.full(2, -3.0), np.full(2, 3.0)),
+                            now=lambda: 0.0, command_arm=lambda q: None)
+    arm = ArmDriver(robot)
+    with pytest.raises(ActionFailed, match="超时"):
+        arm.move_arm_q([1, 1], timeout=-1)
+
+    def broken_tick(on_tick=None):
+        raise RuntimeError("physics failed")
+
+    robot.tick = broken_tick
+    with pytest.raises(RuntimeError, match="physics failed"):
+        arm.move_arm_q([1, 1])
+    assert ToolLayer(None, arm, robot).execute("arm_pose", {"pose": "drop"}) == (
+        False, "工具 arm_pose 执行异常: RuntimeError: physics failed")
+
+
 def test_execution_failure_stops_remaining_actions_and_entire_cli(brain_factory, monkeypatch, tmp_path, capsys):
     import run_collect
     brain = brain_factory([play(actions=[{"action": "observe", "args": {}},
@@ -674,7 +759,8 @@ def test_execution_failure_stops_remaining_actions_and_entire_cli(brain_factory,
     monkeypatch.setattr(run_collect, "build_brain", lambda *a: brain)
     monkeypatch.setattr(run_collect, "ToolLayer", lambda *a, **k: SimpleNamespace(
         execute=execute, schemas_anthropic=lambda: SCHEMAS))
-    code = run_collect.cli(["--brain=vista", "--episodes", "3", "--no-images", "--out", str(tmp_path / "collector")])
+    code = run_collect.cli(["--brain=vista", "--episodes", "3", "--no-images", "--out", str(tmp_path / "collector"),
+                            "--dataset-out", str(tmp_path / "dataset")])
     assert code == 1 and state["resets"] == 1 and state["closed"] and brain.model.closed
     assert executed == ["observe", "forward"] and len(brain.model.requests) == 1
     assert state["ticks"] == 0
@@ -819,6 +905,9 @@ def test_closing_gui_during_settling_stops_physics_and_keeps_partial_record(brai
 def test_recorded_drop_passes_after_settling_without_extra_model_actions(brain_factory, tmp_path):
     """Reproduce ep_0018's released-but-still-rolling ball using its action sequence."""
     import config
+    import h5py
+    from PIL import Image
+    from recorder import DatasetStore
     from run_collect import run_episode
     from sim.env import MobileManipEnv
 
@@ -835,10 +924,11 @@ def test_recorded_drop_passes_after_settling_without_extra_model_actions(brain_f
                for i, (name, args) in enumerate(actions)]
     replies.append(reply(("finish", "finish", {"success": True, "reason": "球已入箱"})))
     brain = brain_factory(replies, begin=False)
+    dataset = DatasetStore(tmp_path / "dataset")
     with MobileManipEnv() as env:
         env.reset(seed=0)
         outcome = run_episode(env, brain, SCHEMAS, TASK, tmp_path / "collector",
-                              save_images=False, verbose=False)
+                              save_images=True, verbose=False, dataset=dataset)
         np.testing.assert_allclose(env.data.ctrl[env.hal.i_act_arm], config.ARM_DROP)
         assert env.data.ctrl[env.hal.i_act_fi] == config.FINGER_OPEN_CTRL
         assert env.success() is True
@@ -849,8 +939,20 @@ def test_recorded_drop_passes_after_settling_without_extra_model_actions(brain_f
     assert len(lines(brain.storage.episode_dir / "actions.jsonl")) == 14
     assert len(lines(brain.storage.episode_dir / "frame_index.jsonl")) == 15
     tail = [row for row in lines(tmp_path / "collector/trajectory.jsonl")
-            if row["t"] > outcome["settling"]["start_t_sim"]]
+            if row["t_end"] > outcome["settling"]["start_t_sim"] + 1e-6]
     assert len(tail) == 30
+    publication = outcome["dataset"]
+    rows = lines(tmp_path / "collector/trajectory.jsonl")
+    assert publication["status"] == "ready" and publication["num_steps"] == len(rows)
+    assert "split" not in publication
+    with h5py.File(dataset.root / publication["h5"], "r") as exported:
+        assert exported["observations/images/front"].shape == (len(rows), 240, 320, 3)
+        for index in (0, len(rows) // 2, len(rows) - 1):
+            row = rows[index]
+            with Image.open(tmp_path / "collector" / row["imgs"][config.CAM_FRONT]) as image:
+                np.testing.assert_array_equal(exported["observations/images/front"][index], np.asarray(image))
+            np.testing.assert_allclose(exported["observations/state"][index], row["state"], atol=1e-7)
+            np.testing.assert_allclose(exported["action"][index], row["action"], atol=1e-7)
 
 
 def test_after_action_storage_failure_never_replays_and_retains_actual_results(brain_factory, monkeypatch, tmp_path):

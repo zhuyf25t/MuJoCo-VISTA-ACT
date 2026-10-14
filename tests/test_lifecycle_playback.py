@@ -87,7 +87,7 @@ def test_episode_closes_recording_resources_on_interruption(tmp_path, monkeypatc
     assert meta["success"] is False and failure.__name__ in meta["reason"]
 
 
-def test_main_closes_environment_when_brain_setup_fails(monkeypatch):
+def test_main_closes_environment_when_brain_setup_fails(monkeypatch, tmp_path):
     import run_collect
 
     closed = []
@@ -100,7 +100,7 @@ def test_main_closes_environment_when_brain_setup_fails(monkeypatch):
 
     monkeypatch.setattr(run_collect, "build_brain", fail)
     with pytest.raises(RuntimeError, match="brain setup failed"):
-        run_collect.main(["--episodes", "1"])
+        run_collect.main(["--episodes", "1", "--dataset-out", str(tmp_path / "dataset")])
     assert closed == [True]
     env.close()  # Idempotent: no second renderer.close().
     assert closed == [True]

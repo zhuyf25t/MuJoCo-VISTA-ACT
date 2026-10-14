@@ -18,8 +18,9 @@ os.environ.setdefault("MUJOCO_GL", "glfw" if sys.platform == "win32" or "--gui" 
 
 import config  # noqa: E402
 from brains.vista.base import Decision  # noqa: E402
+from control.drivers import ActionFailed  # noqa: E402
 from control.tools import ToolLayer  # noqa: E402
-from recorder import EpisodeRecorder, next_episode_dir  # noqa: E402
+from recorder import DatasetStore, EpisodeRecorder, next_episode_dir  # noqa: E402
 from sim.env import MobileManipEnv, parse_task  # noqa: E402
 from viz import CameraRig, GuiViewer  # noqa: E402
 
@@ -66,6 +67,7 @@ def _run_vista_rounds(env, brain, tools, recorder, task_text, tool_schemas,
         fatal = None
         cancelled = False
         for action_index, decision in enumerate(decisions):
+            known_failure = False
             if gui is not None and not gui.is_running():
                 cancelled = True
                 break
@@ -75,13 +77,17 @@ def _run_vista_rounds(env, brain, tools, recorder, task_text, tool_schemas,
                 ok, raw_result = tools.execute(decision.tool, decision.args)
                 if type(ok) is not bool or not isinstance(raw_result, str):
                     raise RuntimeError("控制器返回了无效结果")
+            except ActionFailed as error:
+                ok, raw_result, known_failure = False, str(error), True
             except BaseException as error:
                 ok, raw_result = False, f"控制执行中断: {type(error).__name__}"
                 fatal = error
             # A false boolean from this controller does not prove the robot never moved.
             results[action_index] = action_result(action_index + 1, actions[action_index],
-                                                   "completed" if ok else "unknown")
-            if not ok and fatal is None:
+                                                   "completed" if ok else "failed" if known_failure else "unknown")
+            if known_failure:
+                results[action_index]["action_applied"] = True
+            if not ok and not known_failure and fatal is None:
                 fatal = RuntimeError(f"VISTA 批次 {batch_id} 第 {action_index + 1} 个动作执行进度未知；"
                                      "剩余动作未执行，程序终止。")
             history.append({"tool": decision.tool, "args": dict(decision.args), "ok": ok, "result": raw_result})
@@ -99,10 +105,13 @@ def _run_vista_rounds(env, brain, tools, recorder, task_text, tool_schemas,
                     fatal.add_note("采集器未能保存该子动作的日志")
             if verbose:
                 print(f"  [批次{batch_id:02d}/动作{action_index+1:02d}/轮{index+1:02d}] "
-                      f"{decision.tool}({decision.args}) [{'OK' if ok else 'UNKNOWN'}]", flush=True)
+                      f"{decision.tool}({decision.args}) "
+                      f"[{'OK' if ok else 'FAILED' if known_failure else 'UNKNOWN'}]", flush=True)
             if fatal is not None:
                 cancelled = ok  # A recorder failure can cancel the remainder after a known completion.
                 break
+            if known_failure:
+                break  # Skip the rest of this batch, then let VISTA inspect and recover.
 
         receipt = {"batch_id": batch_id, "tool_call_id": call["id"],
                    "execution_status": batch_status(results, cancelled=cancelled), "action_results": results}
@@ -169,15 +178,24 @@ def _settle_episode(env, outcome, on_tick, gui=None, verbose=True):
 
 def run_episode(env, brain, tool_schemas, task_text, ep_dir, gui=None,
                 save_images: bool = True, verbose: bool = True,
-                seed: int | None = None) -> dict:
+                seed: int | None = None, dataset: DatasetStore | None = None) -> dict:
     # LIFO 释放：记录文件 → 录像相机；环境相机由 env.close() 释放。
     with ExitStack() as resources:
-        rig = (resources.enter_context(CameraRig(env.model, cams=config.REC_CAMS))
+        width, height = config.CAM_FRONT_RES
+        rig = (resources.enter_context(CameraRig(env.model, cams=config.REC_CAMS,
+                                                width=width, height=height))
                if save_images else None)
         gui_realtime = getattr(brain, "gui_realtime", False)
         recorder = resources.enter_context(EpisodeRecorder(ep_dir, {
             "task": task_text, "brain": brain.name, "task_kind": "pickball", "seed": seed,
-        }, capture=rig.render if rig else None))
+            "recording_images": save_images,
+        }, capture=rig.render if rig else None, dataset=dataset))
+        hal = env.robot.hal
+        previous_hook = getattr(hal, "before_tick", None)
+        if previous_hook is not None:
+            raise RuntimeError("机器人已绑定另一个执行前采集器")
+        hal.before_tick = lambda: recorder.before_tick(env.model, env.data, env.robot)
+        resources.callback(setattr, hal, "before_tick", previous_hook)
         last_gui_tick = time.monotonic()
 
         def on_tick():
@@ -207,25 +225,35 @@ def run_episode(env, brain, tool_schemas, task_text, ep_dir, gui=None,
             outcome["decisions"] = len(history)
             outcome["environment_success"] = outcome["success"]
             outcome["vista_episode"] = str(brain.storage.episode_dir)
+            recorder.record_terminal(env.data, env.robot)
             brain.end_episode(outcome)
-            recorder.finish(outcome["success"], {
-                "reason": outcome["reason"], "brain_success": outcome["brain_success"],
-                "stop_code": outcome["stop_code"], "error": outcome.get("error"),
-                "environment_success": outcome["environment_success"],
-                **({"settling": outcome["settling"]} if "settling" in outcome else {}),
-                "decision_rounds": outcome["decision_rounds"],
-                "t_sim": round(float(env.data.time), 2),
-            })
         except BaseException as error:
-            # 中断必须退出所有 episode；保留 VISTA 的故障记录与原始异常。
+            # Interrupted/unknown execution is never eligible for training.
             brain.abort_episode(error, outcome)
             try:
                 recorder.finish(False, {"reason": f"采集中断: {type(error).__name__}", "error": str(error),
+                                        "stop_code": "interrupted",
                                         **({"settling": outcome["settling"]} if "settling" in outcome else {}),
                                         "t_sim": round(float(env.data.time), 2)})
             except Exception as secondary:
                 error.add_note(f"采集中断记录也未能保存：{type(secondary).__name__}")
             raise
+        else:
+            # Export failure must leave the already finalized task result intact.
+            published = recorder.finish(outcome["success"], {
+                "reason": outcome["reason"], "brain_success": outcome["brain_success"],
+                "stop_code": outcome["stop_code"], "error": outcome.get("error"),
+                "environment_success": outcome["environment_success"],
+                **({"settling": outcome["settling"]} if "settling" in outcome else {}),
+                "decision_rounds": outcome["decision_rounds"],
+                "vista_episode": outcome["vista_episode"],
+                "t_sim": round(float(env.data.time), 2),
+            })
+            if published is not None:
+                outcome["dataset"] = published
+                if verbose:
+                    print(f"  [数据] {published['episode_id']}: {published['status']} "
+                          f"({published['h5'] or published['reason']})", flush=True)
         return outcome
 
 
@@ -235,11 +263,13 @@ def main(argv=None) -> int:
     ap.add_argument("--brain-memory", help="VISTA 图片、笔记与调用记录根目录，默认 output/vista")
     ap.add_argument("--max-decisions", type=int, help="最大外层决策轮数")
     ap.add_argument("--episodes", type=int, default=1)
-    ap.add_argument("--task", default=None, help="任务文本，默认把 0 号网球放进收纳箱")
+    ap.add_argument("--task", default=None, help="任务文本，默认把一个网球放进收纳箱")
     ap.add_argument("--gui", action="store_true", help="打开 MuJoCo 交互窗口")
     ap.add_argument("--keep-open", action="store_true", help="采集结束后保持最后画面，关闭窗口退出")
     ap.add_argument("--no-images", action="store_true", help="关闭通用录像图片；VISTA 必需的车头 PNG 仍保存")
     ap.add_argument("--out", default=str(config.EPISODES_DIR))
+    ap.add_argument("--dataset-out", default=str(config.ACT_DATA_DIR),
+                    help="HDF5 和 manifest 根目录；多次运行始终追加，不重置")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args(argv)
@@ -250,7 +280,10 @@ def main(argv=None) -> int:
     if args.max_decisions is not None and args.max_decisions < 1:
         ap.error("--max-decisions 必须至少为 1")
 
-    task = parse_task(args.task or "把0号网球捡起来放进收纳箱")
+    dataset = DatasetStore(args.dataset_out)
+    for recovered in dataset.recover():
+        print(f"[恢复] {recovered['episode_id']}: {recovered['status']}", flush=True)
+    task = parse_task(args.task)
     task_text = args.task or task.text()
     results = []
     with ExitStack() as resources:
@@ -271,15 +304,17 @@ def main(argv=None) -> int:
             if gui:
                 gui.sync()
             ep_dir = next_episode_dir(args.out)
-            print(f"\n== episode {ep + 1}/{args.episodes} -> {ep_dir.name}")
+            print(f"\n== episode {ep + 1}/{args.episodes} (seed={args.seed + ep}) -> {ep_dir.name}")
             result = run_episode(env, brain, schemas, task_text, ep_dir, gui=gui,
                                  save_images=not args.no_images, verbose=not args.quiet,
-                                 seed=args.seed + ep)
+                                 seed=args.seed + ep, dataset=dataset)
             results.append(result)
             print(f"   环境判定: {'PASS' if result['success'] else 'FAIL'} "
                   f"({result['reason']}, 决策 {result['decision_rounds']} 轮 / 工具调用 {result['decisions']} 次)")
             if gui is not None and not gui.is_running():
                 break
+            if not result["success"] and ep + 1 < args.episodes:
+                print("   本集任务失败，已排除；继续下一集。", flush=True)
         n_ok = sum(1 for result in results if result["success"])
         print(f"\n===== 汇总: {n_ok}/{len(results)} 成功 =====")
         if args.keep_open and gui.is_running():

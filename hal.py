@@ -20,6 +20,17 @@ TickCallback = Callable[[], None]
 class RobotInterface(ABC):
     """机器人硬件接口: 低层命令 + 状态 + 感知 + 时间."""
 
+    # Optional recorder hook: after commands are set, before any physical step.
+    before_tick: TickCallback | None = None
+
+    @property
+    def applied_action(self) -> np.ndarray:
+        """最终目标 [肩 rad, 肘 rad, 开度 0闭1开, v m/s, w rad/s]。
+
+        后端须根据实际施加目标实现，不能用实测关节值冒充命令。
+        """
+        raise NotImplementedError("后端未实现施加动作读取")
+
     # ---------- 状态(本体感觉) ----------
     @property
     @abstractmethod
@@ -87,7 +98,7 @@ class RobotInterface(ABC):
 
     @abstractmethod
     def tick(self, on_tick: TickCallback | None = None) -> None:
-        """推进一个控制拍 (10Hz)."""
+        """先调用 before_tick，再推进一拍，最后调用 on_tick (10Hz)."""
 
     def step_ticks(self, n: int = 1, on_tick: TickCallback | None = None) -> None:
         for _ in range(n):

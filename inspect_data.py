@@ -42,12 +42,13 @@ def stats(root: Path) -> None:
         n_ok += bool(ok)
         n_dec += len(d["decisions"])
         n_frames += len(d["traj"])
-        total_sim_t += d["traj"][-1]["t"] if d["traj"] else 0
+        end_t = d["traj"][-1].get("t_end", d["traj"][-1]["t"]) if d["traj"] else 0
+        total_sim_t += end_t
         for r in d["decisions"]:
             tools[r["tool"]] = tools.get(r["tool"], 0) + 1
         print(f"{p.name:<10}{m.get('brain','?'):<10}{'✓' if ok else '✗':<5}"
               f"{len(d['decisions']):<5}{len(d['traj']):<7}"
-              f"{(d['traj'][-1]['t'] if d['traj'] else 0):<8.1f}"
+              f"{end_t:<8.1f}"
               f"{m.get('reason', '')[:40]}")
     print(f"\n汇总: {n_ok}/{len(eps)} 成功 | 平均决策 {n_dec/len(eps):.1f} 次/集 | "
           f"平均时长 {total_sim_t/len(eps):.1f}s/集 | 总帧数 {n_frames}")
@@ -58,7 +59,9 @@ def replay(ep_dir: Path, out: str | None = None, cam: str = "overhead") -> None:
     import imageio.v2 as imageio
     d = load_ep(ep_dir)
     frames = []
-    for rec in d["traj"]:
+    terminal = ep_dir / "terminal.json"
+    tail = [json.loads(terminal.read_text(encoding="utf-8"))] if terminal.exists() else []
+    for rec in d["traj"] + tail:
         img = rec.get("imgs", {}).get(cam)
         if img:
             frames.append(imageio.imread(ep_dir / img))

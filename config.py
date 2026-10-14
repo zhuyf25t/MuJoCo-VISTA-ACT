@@ -11,6 +11,7 @@ ROOT = PKG_DIR  # 项目根
 MODELS_DIR = ROOT / "models"
 DATA_DIR = ROOT / "data"
 EPISODES_DIR = DATA_DIR / "episodes"
+ACT_DATA_DIR = DATA_DIR / "act_v1"
 
 BASE_XML = MODELS_DIR / "base_chassis.xml"
 SCENE_XML = MODELS_DIR / "scene_pickball.xml"

@@ -13,7 +13,7 @@ import numpy as np
 
 import config
 from hal import RobotInterface
-from .drivers import ArmDriver, BaseDriver
+from .drivers import ActionFailed, ArmDriver, BaseDriver
 from . import perception
 
 
@@ -152,6 +152,8 @@ class ToolLayer:
             if missing:
                 return False, f"工具 {name} 缺少参数: {missing}"
             return tool.fn(**args)
+        except ActionFailed:
+            raise  # Known applied motion failure; preserve its recoverable type.
         except TypeError as e:
             return False, f"工具 {name} 参数错误: {e}"
         except Exception as e:                       # noqa: BLE001
