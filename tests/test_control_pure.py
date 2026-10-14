@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from control import BaseDriver, PlanarArm2R  # noqa: E402
+from control import ArmDriver, BaseDriver, PlanarArm2R  # noqa: E402
 import config  # noqa: E402
 
 import pytest  # noqa: E402
@@ -107,6 +108,31 @@ def test_base_driver_reaches_offset_target():
     drv.turn_right(0.5)                         # 目标 -0.5 rad
     _, _, yaw2 = hw.base_pose
     assert abs((yaw2 - yaw_before) + 0.45) < 0.15
+
+
+@pytest.mark.parametrize("joint,delta", [("shoulder", 0.01), ("elbow", -0.01),
+                                        ("shoulder", 0.32), ("elbow", -0.32)])
+def test_arm_nudge_applies_exact_goal_including_small_final_remainder(joint, delta):
+    initial = np.array([0.2, -0.3])
+    commands = []
+    hardware = SimpleNamespace(
+        arm_q=initial.copy(),
+        arm_geometry=lambda: (0.38, 0.40, np.array([-0.3, -2.8]), np.array([2.2, 2.6])),
+        now=lambda: 0.0, tick=lambda on_tick=None: None,
+        step_ticks=lambda n, on_tick=None: None,
+    )
+
+    def command(q):
+        commands.append(q.copy())
+        hardware.arm_q = q.copy()  # Ideal actuator, so only the commanded goal is under test.
+
+    hardware.command_arm = command
+    ok, message = ArmDriver(hardware).nudge(joint, delta)
+    expected = initial.copy()
+    expected[0 if joint == "shoulder" else 1] += delta
+    assert ok, message
+    assert commands, "A valid small nudge must still issue a command"
+    np.testing.assert_allclose(commands[-1], expected, atol=1e-12)
 
 
 if __name__ == "__main__":

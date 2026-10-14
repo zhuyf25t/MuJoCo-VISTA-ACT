@@ -98,6 +98,8 @@ class ArmDriver:
             if self.r.now() - t0 > timeout:
                 return False, f"臂移动超时 (目标 {np.round(q_goal, 2)})"
             self.r.tick(on_tick)
+        # The ramp tolerance must not discard a small nudge or its final remainder.
+        self.r.command_arm(q_goal)
         self.r.step_ticks(3, on_tick)
         err = float(np.linalg.norm(self.r.arm_q - q_goal))
         if err > 0.35:

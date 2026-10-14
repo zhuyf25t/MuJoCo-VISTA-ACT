@@ -91,7 +91,7 @@ class VistaBrain(Brain):
             check_current_round_results(self.state["messages"])
             if self.storage.current_frame_id is None:
                 info = self.storage.archive(obs, source_batch_id=None)
-                context = {"task": task_text, "initial_frame": info,
+                context = {"task": task_text, "initial_frame_id": info["frame_id"],
                            "guide": self.storage.read_memory("guide"),
                            "working": self.storage.read_memory("working")}
                 message = image_message([(info, self.storage.load_image(info["frame_id"]))],
@@ -170,6 +170,8 @@ class VistaBrain(Brain):
             raise RuntimeError("VISTA 当前等待的是 finish，不能接收动作回执")
         self._validate_receipt(receipt, call)
         before = self.storage.current_frame_id
+        # Capture the archived input to this play before archive() advances the pointer.
+        observation = self.storage.frame_info(before)["observation"]
         final_info, fatal = None, None
         try:
             if obs_after is None:
@@ -184,7 +186,7 @@ class VistaBrain(Brain):
             public["error"] = None
             if item["status"] in ("failed", "unknown"):
                 public["error"] = {"code": "ACTION_PROGRESS_UNKNOWN" if item["status"] == "unknown" else "ACTION_FAILED",
-                                   "message": "控制调用未正常完成，物理效果需由图像判断",
+                                   "message": "控制调用未正常完成，物理效果需由图像和实测状态判断",
                                    "can_retry": item["status"] == "failed"}
             results.append(public)
         status = receipt["execution_status"]
@@ -196,12 +198,18 @@ class VistaBrain(Brain):
             fatal = RuntimeError(f"批次 {receipt['batch_id']} 的动作执行进度未知，剩余动作未执行，程序终止。")
         if final_info is None:
             error = {"code": "FRAME_UNAVAILABLE", "message": "没有取得或保存可靠的批次最终图", "can_retry": False}
+        # The snapshot is sent once, beside its image in the following HumanMessage.
+        # Keep only image identity/size in the tool receipt, not a second state copy.
+        frame = ({key: final_info[key] for key in (
+            "episode_id", "frame_id", "camera", "path", "width", "height", "source_batch_id")}
+                 if final_info else None)
         data = {"batch_id": receipt["batch_id"], "tool_call_id": call["id"], "before_frame_id": before,
                 "after_frame_id": final_info["frame_id"] if final_info else None,
-                "execution_status": status, "action_results": results, "frame": final_info}
+                "execution_status": status, "action_results": results, "frame": frame}
         record = {key: deepcopy(data[key]) for key in (
             "batch_id", "tool_call_id", "before_frame_id", "after_frame_id", "execution_status", "action_results")}
-        record.update(actions=deepcopy(call["args"]["actions"]), expectation=call["args"]["expectation"])
+        record.update(observation=observation, actions=deepcopy(call["args"]["actions"]),
+                      expectation=call["args"]["expectation"])
         result = {"ok": status == "completed" and final_info is not None, "data": data, "error": error}
         try:
             self.storage.append_batch(record)
@@ -210,7 +218,7 @@ class VistaBrain(Brain):
             if final_info:
                 metadata = {**final_info, "tool_call_id": call["id"], "batch_id": receipt["batch_id"]}
                 messages.append(image_message([(metadata, self.storage.load_image(final_info["frame_id"]))],
-                                              "这是该 play 批次结束或停止后的真实车头观察。控制完成不保证任务成功。"))
+                                              "这是该 play 批次结束或停止后的车头图及同一时刻的实测状态，也是下一批的执行前观测。控制完成不保证任务成功。"))
             self._append(messages)
         except Exception as error:
             if fatal is None:

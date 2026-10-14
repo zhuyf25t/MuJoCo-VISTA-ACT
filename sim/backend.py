@@ -24,6 +24,7 @@ class MjRobot(RobotInterface):
         self.model, self.data = model, data
         m = model
         self.i_free = m.joint(config.JOINT_BASE).qposadr[0]
+        self.i_base = m.body(config.BODY_BASE).id
         self.i_wl = m.actuator(config.ACT_WHEEL_L).id
         self.i_wr = m.actuator(config.ACT_WHEEL_R).id
         self.i_act_arm = np.array([m.actuator(config.ACT_SHOULDER).id,
@@ -64,6 +65,16 @@ class MjRobot(RobotInterface):
     @property
     def arm_q(self) -> np.ndarray:
         return np.array([self.data.qpos[self.j_sh], self.data.qpos[self.j_el]])
+
+    @property
+    def base_velocity(self) -> np.ndarray:
+        # Refresh derived velocity at the current qpos/qvel without advancing time.
+        mujoco.mj_forward(self.model, self.data)
+        velocity = np.empty(6)
+        # XBODY uses the base origin/axes, not the body's inertial COM frame.
+        mujoco.mj_objectVelocity(self.model, self.data, mujoco.mjtObj.mjOBJ_XBODY,
+                                self.i_base, velocity, 1)
+        return np.array([velocity[3], velocity[2]])  # rot:lin, local +x/+z
 
     @property
     def tcp_pos(self) -> np.ndarray:

@@ -1,4 +1,4 @@
-"""Immutable front-camera PNGs, fixed note files and append-only JSONL logs."""
+"""Immutable image/state snapshots, fixed notes and append-only JSONL logs."""
 
 from __future__ import annotations
 
@@ -9,6 +9,8 @@ import math
 import os
 import re
 import tempfile
+from copy import deepcopy
+from numbers import Real
 from pathlib import Path
 
 import numpy as np
@@ -136,8 +138,30 @@ class VistaStorage:
             raise RuntimeError("FRAME_UNAVAILABLE: VISTA 需要 images.front 的非空 uint8 RGB 原图")
         return rgb
 
+    @staticmethod
+    def observation_state(obs: dict) -> dict:
+        """Copy only public measurements; never forward arbitrary environment fields."""
+        def finite(value):
+            if isinstance(value, bool) or not isinstance(value, Real):
+                raise ValueError
+            value = float(value)
+            if not math.isfinite(value):
+                raise ValueError
+            return value
+
+        try:
+            state = obs["observation"]
+            public = {key: finite(state[key]) for key in (
+                "shoulder_rad", "elbow_rad", "gripper_opening", "base_v_mps", "base_w_radps")}
+            if not 0 <= public["gripper_opening"] <= 1:
+                raise ValueError
+            return {"timestamp_s": finite(obs["timestamp_s"]), "observation": public}
+        except (KeyError, TypeError, ValueError, OverflowError):
+            raise RuntimeError("OBSERVATION_UNAVAILABLE: 需要有效采样时间和五维实测状态，夹爪开度须在 [0,1]") from None
+
     def archive(self, obs: dict, source_batch_id: int | None) -> dict:
         rgb = self.front_rgb(obs)
+        snapshot = self.observation_state(obs)
         frame_id = f"f{len(self.frames):06d}"
         path = self._episode() / "frames" / f"{frame_id}.png"
         if not path.parent.resolve().is_relative_to(self._episode()):
@@ -153,19 +177,19 @@ class VistaStorage:
             info = {"episode_id": self._episode().name, "frame_id": frame_id,
                     "camera": "front", "path": f"frames/{frame_id}.png",
                     "width": int(rgb.shape[1]), "height": int(rgb.shape[0]),
-                    "source_batch_id": source_batch_id}
+                    "source_batch_id": source_batch_id, **snapshot}
             self.append("frame_index", info)
         except (OSError, ValueError):
             raise RuntimeError("FRAME_UNAVAILABLE: 无法保存 VISTA 原始 PNG，未发布该帧") from None
         self.frames[frame_id] = info
         self._frame_hashes[frame_id] = hashlib.sha256(contents).hexdigest()
         self.current_frame_id = frame_id
-        return dict(info)
+        return deepcopy(info)
 
     def frame_info(self, frame_id: str) -> dict:
         if frame_id not in self.frames:
             raise KeyError(frame_id)
-        return dict(self.frames[frame_id])
+        return deepcopy(self.frames[frame_id])
 
     def load_image(self, frame_id: str) -> Image.Image:
         info = self.frame_info(frame_id)
@@ -188,8 +212,11 @@ class VistaStorage:
 
     def check_observation(self, obs: dict) -> None:
         rgb = self.front_rgb(obs)
-        if not np.array_equal(rgb, np.asarray(self.load_image(self.current_frame_id))):
-            raise RuntimeError("VISTA 当前观察与已接收的批次最终图不一致，请先接回真实批次结果")
+        snapshot = self.observation_state(obs)
+        saved = self.frame_info(self.current_frame_id)
+        if (any(snapshot[key] != saved[key] for key in snapshot)
+                or not np.array_equal(rgb, np.asarray(self.load_image(self.current_frame_id)))):
+            raise RuntimeError("VISTA 当前观察与已接收的批次最终图或实测状态不一致，请先接回真实批次结果")
 
     def _memory_path(self, kind: str) -> Path:
         if kind not in ("guide", "working"):
@@ -231,7 +258,7 @@ class VistaStorage:
             if not path.resolve().is_relative_to(self._episode()):
                 raise ValueError("history path changed")
             entries = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
-            required = {"batch_id", "tool_call_id", "actions", "expectation", "before_frame_id",
+            required = {"batch_id", "tool_call_id", "observation", "actions", "expectation", "before_frame_id",
                         "after_frame_id", "execution_status", "action_results"}
             if len(entries) != self.batch_count:
                 raise ValueError("history count mismatch")
@@ -242,6 +269,8 @@ class VistaStorage:
                         or not isinstance(entry["action_results"], list)
                         or len(entry["actions"]) != len(entry["action_results"])):
                     raise ValueError("invalid batch record")
+                if entry["observation"] != self.frames[entry["before_frame_id"]]["observation"]:
+                    raise ValueError("batch observation does not match its input frame")
             filtered = [{key: entry[key] for key in required} for entry in entries
                         if (start_batch is None or entry["batch_id"] >= start_batch)
                         and (end_batch is None or entry["batch_id"] <= end_batch)]

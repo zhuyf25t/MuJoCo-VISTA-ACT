@@ -16,6 +16,10 @@ from .state import validate_reply
 from .storage import VistaStorage
 
 
+# Temporary VISTA policy: measurements are visible, but arm motion uses presets only.
+DISABLED_ACTIONS = frozenset({"shoulder", "elbow"})
+
+
 class _Arguments(ValueError):
     def __init__(self, code, message, hint="请根据工具说明修改参数"):
         super().__init__(message)
@@ -135,7 +139,7 @@ def tool_schemas(settings: VistaSettings, actions: dict) -> list[dict]:
                       for name in ("x", "y", "width", "height")}, ("x", "y", "width", "height"))
     region["description"] = coordinates
     view = {"label": _text("这张图在比较中的角色，例如批次前", settings.max_label_chars),
-            "frame_id": _text("当前 episode 内已归档的原图编号，例如 f000000", 64), "region": region}
+            "frame_id": _text("当前 episode 内已归档的原图编号，例如 f000000；不是文件名或路径。当前图也可查询，无需先存在 history 批次记录", 64), "region": region}
     inspect_schema = _object({"question": _text("此次查图要直接看清的状态、关系或待解决疑点；原文保留在上下文中", settings.max_question_chars),
                               "views": {"type": "array", "minItems": 1, "maxItems": settings.max_views,
                                         "items": _object(view, ("label", "frame_id"))}}, ("question", "views"))
@@ -146,17 +150,27 @@ def tool_schemas(settings: VistaSettings, actions: dict) -> list[dict]:
                                        "items": _object(pixel_view, pixel_view.keys())}}, ("question", "views"))
     action_variants = []
     for name, definition in actions.items():
+        if name in DISABLED_ACTIONS:
+            continue
         action_variants.append(_object({"action": {"type": "string", "enum": [name],
                                                    "description": definition["description"]},
                                          "args": definition["parameters"]}, ("action", "args")))
     guide_scope = "scope=environment：同一套场景、相机和控制设定的经验，跨多个 episode 保留。"
     working_scope = "scope=episode：从环境初始化到任务结束的一次完整实验，跨工具调用和动作批次保留，新实验另建文件。"
     definitions = [
-        ("inspect", "读取历史原图或裁剪放大，不推进环境、不回答 question。" + coordinates,
+        ("inspect", "按 frame_id 读取当前或历史归档原图/裁剪图；图旁 observation 和 timestamp_s 属于该原图采样时刻。"
+         "通过图片索引查找，不依赖 history 中已有动作记录；不推进环境、不回答 question、不改变当前观测。" + coordinates,
          inspect_schema),
         ("read_pixels", f"从原图区域的均匀网格中心读取 RGB 和坐标，不识别物体；所有区域合计最多 {settings.max_samples} 点。" + coordinates,
          pixels_schema),
-        ("history", "查询本 episode 每次 play 的批次记录；一个批次包含全部子动作。返回帧编号，不自动返回图片。无范围时取最近 limit 批，始终按编号升序。",
+        ("history", "查询本 episode 已结束或中断并结算的 play 批次；尚未提交或正在执行的批次不在历史中，初始为空。"
+         "每批结束时只追加一条记录，包含全部子动作 actions、expectation、execution_status、action_results 及前后帧编号。"
+         "observation 只保存本批执行前的五维实测状态，严格对应 before_frame_id；不是目标命令或执行后状态。"
+         "字段为 shoulder_rad、elbow_rad（实际角度，rad），gripper_opening（实际连续开度，0 全闭、1 全开），"
+         "base_v_mps（车体前向实际速度，m/s，正前进），base_w_radps（绕车体竖轴实际角速度，rad/s，正左转）。"
+         "after_frame_id 仅关联执行后观测，不额外展开一组执行后状态；它也是下一批的 before_frame_id。"
+         "当前观测已随图片提供，即使尚无对应 play 记录也可用 inspect 查看。返回帧编号，不自动返回图片；用 inspect 按编号查看。"
+         "无范围时取最近 limit 批，始终按编号升序。",
          _object({"start_batch": _integer("包含的起始批次", 1), "end_batch": _integer("包含的结束批次", 1),
                   "limit": {**_integer("最多返回的批次数，不是动作数", 1, settings.history_max_limit),
                             "default": settings.history_default_limit}})),
@@ -166,7 +180,9 @@ def tool_schemas(settings: VistaSettings, actions: dict) -> list[dict]:
         ("read_working", "读取当前计划、假设、预期和未决问题。" + working_scope, _object({})),
         ("write_working", "完整替换本次实验草稿，不会修改历史事实。" + working_scope,
          _object({"content": _text("完整新版草稿", settings.max_working_chars)}, ("content",))),
-        ("play", "提交一批按数组顺序连续执行的动作，批内不再调用模型，结束后只反馈最终图。必须独占本条模型回复；expectation 是整批预期，不是成功证明。",
+        ("play", "提交一批按数组顺序连续执行的动作；肩/肘单关节微调暂时禁用，手臂仅可用 arm_pose 预设。"
+         "批内不再调用模型，结束后反馈最终图及同一时刻的 observation 实测状态。"
+         "history 本批 observation 记录的是执行前状态。必须独占本条模型回复；expectation 是整批预期，不是成功证明。",
          _object({"actions": {"type": "array", "minItems": 1, "maxItems": settings.max_actions,
                                "items": {"oneOf": action_variants}},
                   "expectation": _text("整批结束后预期看见的变化；若用于验证，说明要直接看清什么、支持或否定假设的结果，以及何时仍无法判断", settings.max_question_chars),
@@ -230,6 +246,11 @@ class VistaTools:
                         raise _Arguments("INVALID_ACTION", "play.actions 不能为空")
                     if len(actions) > self.settings.max_actions:
                         raise _Arguments("ACTION_LIMIT", f"每批最多 {self.settings.max_actions} 个动作")
+                    if any(isinstance(action, dict) and isinstance(action.get("action"), str)
+                           and action["action"] in DISABLED_ACTIONS
+                           for action in actions):
+                        raise _Arguments("ACTION_DISABLED", "shoulder/elbow 单关节微调暂时禁用，整批未执行",
+                                         "手臂请使用 arm_pose 的 stow/carry/reach/drop 预设")
             try:
                 _check(self.parameters[name], args)
             except _Arguments as error:
@@ -269,7 +290,8 @@ class VistaTools:
                     size = (max(1, round(width * scale)), max(1, round(height * scale)))
                     rendered = original.crop((x, y, x + width, y + height)).resize(size, Image.Resampling.NEAREST)
                     meta["rendered_size"] = list(size)
-                    images.append((meta, rendered))
+                    images.append(({**meta, "timestamp_s": info["timestamp_s"],
+                                    "observation": info["observation"]}, rendered))
                 else:
                     rows, columns = view["rows"], view["columns"]
                     samples = []

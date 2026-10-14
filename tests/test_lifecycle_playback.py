@@ -14,6 +14,38 @@ from playback import Frame, PlaybackCursor, apply_frame, load_trajectory, trajec
 from sim.env import MobileManipEnv
 
 
+@pytest.mark.parametrize("yaw", [0.0, np.pi / 2, -np.pi / 3])
+def test_observation_measures_body_velocity_and_actual_joints_without_stepping(yaw, monkeypatch):
+    with MobileManipEnv() as env:
+        data, hal = env.data, env.hal
+        data.qpos[hal.i_free + 3:hal.i_free + 7] = [np.cos(yaw / 2), 0, 0, np.sin(yaw / 2)]
+        dadr = env.model.joint(config.JOINT_BASE).dofadr[0]
+        # Motion contains a sideways component, which must not become forward speed.
+        forward, sideways, turn = 0.23, -0.17, -0.31
+        data.qvel[dadr:dadr + 6] = [forward * np.cos(yaw) - sideways * np.sin(yaw),
+                                  forward * np.sin(yaw) + sideways * np.cos(yaw), 0, 0, 0, turn]
+        data.qpos[[hal.j_sh, hal.j_el]] = [0.21, -0.32]
+        data.qpos[env.model.joint(config.JOINT_FINGER).qposadr[0]] = 0.02
+        hal.command_arm(np.array([0.8, 0.9]))
+        hal.command_finger(config.FINGER_OPEN_CTRL)
+        hal.command_drive(-0.4, 0.7)  # Goals intentionally disagree with actual motion.
+        data.time = 1.25
+        captures = []
+
+        def capture():
+            captures.append(data.time)
+            return np.zeros((3, 4, 3), dtype=np.uint8)
+
+        monkeypatch.setattr(hal, "front_image", capture)
+        obs = env.get_obs()
+        assert obs["observation"] == pytest.approx({
+            "shoulder_rad": 0.21, "elbow_rad": -0.32, "gripper_opening": 0.6,
+            "base_v_mps": forward, "base_w_radps": turn})
+        assert captures == [1.25] and obs["timestamp_s"] == data.time == 1.25
+        data.qvel[:] = 0
+        assert hal.base_velocity == pytest.approx([0, 0])  # Drive commands alone are not feedback.
+
+
 def test_camera_rig_closes_partial_construction(monkeypatch):
     from viz import CameraRig
 

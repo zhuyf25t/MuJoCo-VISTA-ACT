@@ -2,7 +2,13 @@
 
 实现日期：2026-10-08。**本目录已实现第一版 VISTA Brain，并接入 `run_collect.py --brain=vista`。** 旧论文、译本和官方源码快照已归档到仓库根目录 `_archive/20261013-pre-vista/files/brains/`。当前 `brains/` 仅保留 `vista/`。下文保留架构和工具约定，代码片段用于解释流程，完整实现以同目录的 Python 文件为准。
 
-第一版的目标很具体：模型收到车头图，可以一次请求多个工具来查旧图、裁图、读像素、读写笔记；用一次 `play` 提交一批 MuJoCo 动作；外层按顺序执行整批，再返回最终图片和各子动作结果；模型沿用原来的消息历史继续。先证明这条链能闭合。暂不做上下文压缩、语义图片搜索、子图或多个模型分工。多个工具请求先顺序执行、统一反馈；不要求引入并发编程。
+当前模型收到车头图及同一时刻的五维本体实测状态，可以一次请求多个工具来查旧图、裁图、读像素、读写笔记；用一次 `play` 提交一批 MuJoCo 动作；外层按顺序执行整批，再返回最终图片、实测状态和各子动作结果；模型沿用原来的消息历史继续。暂不做上下文压缩、语义图片搜索、子图或多个模型分工。多个工具请求先顺序执行、统一反馈；不要求引入并发编程。
+
+2026-10-14 观测更新：`sim/env.py` 从 HAL 读取 `observation={shoulder_rad, elbow_rad, gripper_opening, base_v_mps, base_w_radps}`，分别表示肩/肘实际角度（rad）、实际连续开度（0 闭、1 开）、车体前向速度（m/s）及绕车体竖轴的转向角速度（rad/s，正左转）。`timestamp_s` 是图像与状态的采样时刻，当前使用仿真时间。底盘速度来自当前物理状态；MuJoCo 使用普通车体原点和坐标轴，而非惯性主轴，参见 [mj_objectVelocity 实现](https://github.com/google-deepmind/mujoco/blob/3.3.7/src/engine/engine_core_util.c#L682)。读数不是动作目标，夹爪目标虽只有开/闭，实测开度仍保留中间值。
+
+相邻两次 play 之间只采集一次观测：`O0 → play A → O1 → play B → O2`。A 的 after 和 B 的 before 共用 O1 的 frame_id；下一次 `decide()` 只校验已有观测，不再次拍照或追加。每次请求发送累计历史，里面包含过去的观测消息；这不代表重新采样。新状态写在图片旁的 HumanMessage 文本中，不再复制进同一批 play 的 ToolMessage。主动 `inspect` 时可再次看到对应原图的状态，且不会改写当前观测；主动查询 `history` 则返回各已结算批次的执行前 `observation`。
+
+当前临时策略仍禁止肩/肘单关节微调：`shoulder`、`elbow` 保留底层实现，但不出现在模型的 play 动作 Schema 中；即使模型自行提交也返回 `ACTION_DISABLED`，整批不执行。手臂只允许 `arm_pose` 四种预设。读取关节状态不等于开放自由控制。解除限制时须同步修改 `DISABLED_ACTIONS` 与 system prompt。
 
 **State 只保留 `messages`、`model_calls` 两个字段。** 有效 play 经条件边到 END，外层执行动作；无法继续的异常直接 raise，最外层打印说明并以退出码 1 结束整个程序。动作和预期已在 AIMessage 中，工具结果另建 ToolMessage；只核对当前轮的配对，不另存动作副本或停止原因。模型调用上限从 `max_model_calls` 配置读取。
 
@@ -67,8 +73,8 @@ mujoco/
             │   ├── f000000.png    初始车头原图
             │   ├── f000001.png    第一批动作结束后的车头原图
             │   └── ...
-            ├── frame_index.jsonl  图片编号 → 相对文件路径、尺寸、来源批次
-            ├── actions.jsonl      每次 play 一条：整批请求、子动作结果、预期、前后帧
+            ├── frame_index.jsonl  图片编号 → 路径、尺寸、来源批次、采样时间、实测状态
+            ├── actions.jsonl      每次 play 一条：执行前 observation、请求、结果、预期、前后帧
             ├── calls.jsonl        所有工具的请求与结果，包括失败的检查
             ├── messages.jsonl     消息轨迹，供人检查；不是第一版的自动恢复入口
             └── outcome.json       本集结局与外层评分，仅供人检查，不作为模型输入
@@ -81,8 +87,8 @@ mujoco/
 | `graph.py`、`state.py` | model/tools 循环、消息累计、调用预算、工具请求与结果配对 | 新环境是否继续采用 play 提交批次、外层回传结果的约定 |
 | `model.py` | 文本/图片/工具消息转换和模型请求 | 当前仅适配 OpenAI 兼容 Chat Completions；换 API 协议需要另写适配 |
 | `brain.py` | 同一 episode 的上下文延续、动作交接和结果接回 | 本项目的 Brain/Decision 接口、车头观察格式和结束判定 |
-| `tools.py` | 查图、读像素、history、笔记读写及参数检查 | `action_schemas()` 中固定的十个 MuJoCo 动作、姿态、单位和范围 |
-| `storage.py`、`settings.py` | PNG 编号与归档、笔记作用域、JSONL 日志、预算和长度配置 | `images.front` 观察入口、车头相关初始笔记，以及项目 config 和默认路径 |
+| `tools.py` | 查图、读像素、history、笔记读写及参数检查 | 十个底层动作的定义，以及 `DISABLED_ACTIONS` 临时限制（当前向模型开放八个动作） |
+| `storage.py`、`settings.py` | PNG/实测快照归档、笔记作用域、JSONL 日志、预算和长度配置 | `images.front`、五维状态白名单、时间戳约定，以及项目 config 和默认路径 |
 
 `prompts/system.txt`、外层 `run_collect.py` 和 `control/tools.py` 当前承担具体任务和环境的适配，因此没有把它们整体标为通用。提示词中的查图、记笔记、提交批次等协议可以沿用，但车头相机、抓球任务和机器人动作说明需要随环境调整。迁移时主要替换**观察入口、动作定义与执行器、任务提示词**，通常不必重写 LangGraph 的两个节点和转移边。
 
@@ -263,7 +269,8 @@ self.state["messages"] = add_messages(self.state["messages"], result_messages)
 | 全部归档图片和索引 | PNG + frame_index.jsonl | 当前图直接提供，旧图通过 inspect |
 | 指南、草稿 | guide.md、working.md | 初始化和对应读写工具 |
 | 客观批次历史 | actions.jsonl | history 返回选定范围 |
-| 仿真坐标、关节回读、成功真值 | 现有环境/记录器 | 第一版视觉 brain 不作为判断依据读取 |
+| 五维本体实测状态与采样时间 | frame_index.jsonl | 随对应图片发送；inspect 返回原图当时的状态 |
+| 世界坐标、TCP、物体/持球及成功真值 | 现有环境/记录器 | 不作为模型输入 |
 
 State 不必装下文件本体、连接和整个仿真世界。节点通过普通对象访问所需资源即可。
 
@@ -489,7 +496,7 @@ Schema 告诉模型怎么填参数，Python 校验才决定是否接受。`Typed
 
 上述坐标约定、inspect 的回看/裁剪用途及“不推进环境”都必须写进模型实际收到的工具 description 与 region 参数说明；只写在 README 不够。尺寸由图片元数据提供，Python 负责实际越界检查。
 
-返回内容：每张图的 `label`、`source_frame_id`、原图尺寸、实际选取区域、输出尺寸、真实图片内容；另有 `current_state_unchanged=true`。结果顺序与 `views` 一致。
+返回内容：每张图的 `label`、`source_frame_id`、原图尺寸、实际选取区域、输出尺寸、真实图片内容；另有 `current_state_unchanged=true`。图片消息中还附带该原图采样时的 `observation` 和 `timestamp_s`。结果顺序与 `views` 一致。工具通过图片索引按 `frame_id` 找图，不接受文件名或路径，也不要求存在对应的 history 批次；当前图在执行动作前就已归档，可直接查看。
 
 裁剪后按比例将长边调整为 1024 像素，用最近邻插值；短边至少为 1 像素。第一版采用固定规则，不提供额外的缩放参数。返回 `rendered_size`，让模型知道展示图和原图不是同一坐标系。原始 PNG 不变，工具也不会生成“球抓住了”的判断。
 
@@ -563,7 +570,9 @@ sample_y = y + floor((2*r + 1) * height / (2*rows))
 
 limit 是可选的输出量控制，不是主流程必需字段，也不会进入 State。早期历史很短时可忽略它；历史变长后用它避免一次取回过多内容。模型无需每次填写，有需要再调小或调大，结果明确告知是否截断。
 
-每条公开记录返回：`batch_id`、`tool_call_id`、请求的 `actions`、批次 `expectation`、`before_frame_id`、`after_frame_id`、整体 `execution_status` 和 `action_results`。子动作在批内按 `index=1,2,...` 编号，其状态区分完成、失败、进度未知和未执行；具体结构见第 6.8 节。
+每条公开记录返回：`batch_id`、`tool_call_id`、执行前的 `observation`、请求的 `actions`、批次 `expectation`、`before_frame_id`、`after_frame_id`、整体 `execution_status` 和 `action_results`。`observation` 对象只含 `shoulder_rad`、`elbow_rad`（rad）、`gripper_opening`（0 闭、1 开，连续）、`base_v_mps`（m/s，正前进）、`base_w_radps`（rad/s，正左转）五个实测值，严格对应 `before_frame_id`，不是目标命令，也不是执行后状态。记录不展开第二组执行后状态。子动作在批内按 `index=1,2,...` 编号，其状态区分完成、失败、进度未知和未执行；具体结构见第 6.8 节。
+
+初始 history 为空，尚未提交或正在执行的批次不在其中。当前观测已随图片提供并归档；批次结束时从该批的执行前归档复制 `observation`，一次性追加记录，不在开始写一遍再覆盖。于是两条相邻记录分别保存 `(O0 的状态, A0)` 和 `(O1 的状态, A1)`；上一条的 after_frame_id 与下一条的 before_frame_id 相同。工具 description 明确这些时序和字段单位；`observation` 是工具返回字段，不是让模型填写的输入参数。
 
 批次编号由外层在执行交接时分配，执行请求先进入 `calls.jsonl`，结算后将一条批次记录写入 `actions.jsonl`。部分执行或已交接后取消的批次也保留，不伪装成全部成功；参数校验阶段被拒的 `play` 不占批次编号。`finish` 是结束请求，也不占批次编号。进程中途崩溃而未结算的请求只能在调用日志中看到，第一版不自动补造完整历史。
 
@@ -571,7 +580,7 @@ limit 是可选的输出量控制，不是主流程必需字段，也不会进�
 
 **history 不自动返回图片。** 模型先找到 `after_frame_id`，再通过 `inspect` 查看。第一版不提供自然语言搜索，不自动生成图片语义标签，也不查询其他 episode。
 
-返回的记录不含底层持球真值、坐标或调试提示。文件解析损坏 → `HISTORY_UNAVAILABLE` 并停止，不把损坏误报成“历史为空”。
+返回的记录不含底层持球真值、世界坐标或调试提示。文件解析损坏或 observation 与执行前归档不一致 → `HISTORY_UNAVAILABLE` 并停止，不把损坏误报成“历史为空”。
 
 ### 6.4 `read_guide()`：读取稳定经验
 
@@ -754,11 +763,19 @@ finish 校验通过后 tools 返回 `{}`，条件边正常到 END。外层从当
   "path": "frames/f000006.png",
   "width": 640,
   "height": 480,
-  "source_batch_id": 6
+  "source_batch_id": 6,
+  "timestamp_s": 12.4,
+  "observation": {
+    "shoulder_rad": 0.3,
+    "elbow_rad": -0.2,
+    "gripper_opening": 0.6,
+    "base_v_mps": 0.01,
+    "base_w_radps": -0.02
+  }
 }
 ```
 
-上面的宽高是示意，必须从实际图片采集，不写死 640×480。path 相对于当前 episode 目录，模型不可以修改；完整身份是 (episode_id, frame_id)。工具只访问当前 episode，因此模型填一个 frame_id 就够了。初始帧的 source_batch_id=null。图片索引不保存仿真时间；身份与顺序由图片编号、批次编号确定。现有采集器自己的时间日志保持独立。
+上面的数值是示意，必须从实际观测采集，不写死宽高或状态。path 相对于当前 episode 目录，模型不可以修改；完整身份是 (episode_id, frame_id)。工具只访问当前 episode，因此模型填一个 frame_id 就够了。初始帧的 source_batch_id=null。采样时间及状态与图片一同归档，即使最终批次之后不再调用模型，也会保留该观测。`actions.jsonl` 用 before_frame_id/after_frame_id 关联两端，仅内嵌执行前的 observation；未来离线导出可按编号取得图像及时间。收尾仿真期间的控制拍记录属于通用采集器，不会自动新增 VISTA 观测。
 
 **保存到哪里与消息是否在内存里是两回事。** `self.state` 保持进程内的上下文；磁盘 PNG 和 JSONL 独立存在，不使用 SQLite。messages 中可以有模型看过的图像内容块，但整个图片库不进入 State。按文件编号查到图片后，发送给模型时仍须读取实际像素内容。
 
@@ -857,9 +874,9 @@ brain.end_episode(outcome)
 
 ### 7.5 哪些反馈允许进入模型
 
-当前 `env.get_obs()` 除图片外还有关节角、TCP、底盘位置；采集器还附加 `holding`。原控制工具的结果文本可能包含抓取真值和夹爪提示。**不能把整个 obs、history 或 result 原样拼进消息。**
+当前 `env.get_obs()` 除图片、采样时间和五维 observation 外还保留了兼容字段及 TCP、底盘位置。原控制工具的结果文本可能包含抓取真值和夹爪提示。**不能把整个 obs、history 或 result 原样拼进消息。** storage 显式提取图像、时间与五个白名单实测字段；缺失或无效时停止，不用目标值或零值伪造反馈。
 
-本版公开给模型的只有：任务、车头图片和身份元数据、它自己请求的动作及参数、施加情况/技术执行状态、它自己写的笔记与预期、上述公开工具结果。底层详细反馈继续留在本地采集记录，用于实验分析。
+本版公开给模型的只有：任务、车头图片和身份元数据、同一时刻的五维本体实测状态与采样时间、它自己请求的动作及参数、施加情况/技术执行状态、它自己写的笔记与预期、上述公开工具结果。底层详细反馈继续留在本地采集记录，用于实验分析。
 
 未知执行错误用固定的技术错误码解释，不复述可能包含真值的底层文本。API 网络故障、鉴权失败、上下文过长等由宿主记录并停止；第一版不自动重试 API，也不会为修复 API 错误重放 MuJoCo 动作。
 

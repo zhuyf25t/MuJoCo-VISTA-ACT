@@ -44,6 +44,9 @@ def play(identifier="play", frame="f000000", actions=None):
 def observation(value=0, size=(8, 12)):
     return {"images": {"front": np.full((*size, 3), value, dtype=np.uint8),
                        "overhead": np.full((*size, 3), 255, dtype=np.uint8)},
+            "timestamp_s": float(value),
+            "observation": {"shoulder_rad": 0.1, "elbow_rad": -0.2,
+                               "gripper_opening": 0.6, "base_v_mps": 0.05, "base_w_radps": -0.1},
             "holding": "PRIVATE_HOLDING", "base_pose": "PRIVATE_POSE", "tcp_pos": "PRIVATE_TCP"}
 
 
@@ -104,6 +107,131 @@ def results(brain):
 
 def lines(path):
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def test_each_batch_boundary_has_one_shared_observation(brain_factory):
+    brain = brain_factory([play(), play("next", "f000001"), finish()])
+    initial, middle, final = observation(), observation(1), observation(2)
+    middle["observation"]["shoulder_rad"] = 0.4
+    final["observation"]["shoulder_rad"] = 0.8
+    initial["observation"]["private"] = "PRIVATE_EXTRA"
+    decide(brain, initial)
+    brain.accept_batch_result(receipt(brain), middle)
+    assert len(brain.model.requests) == 1  # Appending feedback does not invoke the model.
+    decide(brain, middle)
+    request = api_messages(brain.model.requests[-1]["messages"], "system")
+    assert [item["role"] for item in request] == ["system", "user", "assistant", "tool", "user"]
+    snapshots = [json.loads(block["text"]) for item in request if item["role"] == "user"
+                 for block in item["content"] if block["type"] == "text" and '"observation"' in block["text"]]
+    assert [info["frame_id"] for info in snapshots] == ["f000000", "f000001"]
+    assert [info["observation"]["shoulder_rad"] for info in snapshots] == [0.1, 0.4]
+    assert sum(block["type"] == "image_url" for item in request if item["role"] == "user"
+               for block in item["content"]) == 2
+    assert "observation" not in request[3]["content"]  # Not also repeated in the tool receipt.
+    assert "PRIVATE_" not in json.dumps(request)
+    brain.accept_batch_result(receipt(brain), final)
+    assert len(brain.model.requests) == 2
+    records = brain.storage.history()["batches"]
+    assert records[0]["after_frame_id"] == records[1]["before_frame_id"] == "f000001"
+    assert [record["observation"]["shoulder_rad"] for record in records] == [0.1, 0.4]
+    assert all(set(record["observation"]) == set(middle["observation"]) for record in records)
+    assert lines(brain.storage.episode_dir / "actions.jsonl") == records
+    frames = lines(brain.storage.episode_dir / "frame_index.jsonl")
+    assert len(frames) == 3  # Terminal observation saved even without another decide().
+    assert frames[-1]["observation"] == final["observation"]
+    assert frames[-1]["timestamp_s"] == final["timestamp_s"]
+
+
+def test_history_is_settled_only_but_inspect_can_read_current_frame(brain_factory):
+    view = lambda frame: {"question": "当前图", "views": [{"label": "当前", "frame_id": frame}]}
+    brain = brain_factory([
+        reply(("empty", "history", {}), ("initial", "inspect", view("f000000"))), play(),
+        reply(("past", "history", {}), ("current", "inspect", view("f000001"))),
+        play("next", "f000001"),
+    ])
+    before, after = observation(), observation(1)
+    after["observation"]["elbow_rad"] = 0.45
+    decide(brain, before)
+    assert results(brain)["empty"]["data"]["batches"] == []
+    assert results(brain)["initial"]["ok"] is True
+    path = brain.storage.episode_dir / "actions.jsonl"
+    assert path.read_bytes() == b""  # Submitted play has no history row until settled.
+    brain.accept_batch_result(receipt(brain), after)
+    saved = path.read_bytes()
+    decide(brain, after)
+    row, = results(brain)["past"]["data"]["batches"]
+    assert row["observation"] == before["observation"] != after["observation"]
+    assert results(brain)["current"]["ok"] is True
+    assert path.read_bytes() == saved  # Starting the next play does not rewrite history.
+    brain.accept_batch_result(receipt(brain), observation(2))
+    rows = lines(path)
+    assert rows[0] == row and rows[1]["observation"] == after["observation"]
+    assert path.read_bytes().startswith(saved)
+    # Returned history objects cannot mutate the saved state or subsequent queries.
+    row["observation"]["shoulder_rad"] = 99
+    assert brain.storage.history()["batches"][0]["observation"] == before["observation"]
+
+
+def test_history_rejects_state_replaced_with_post_action_observation(brain_factory):
+    brain = brain_factory([play()])
+    decide(brain)
+    after = observation(1)
+    after["observation"]["gripper_opening"] = 0.1
+    brain.accept_batch_result(receipt(brain), after)
+    path = brain.storage.episode_dir / "actions.jsonl"
+    row, = lines(path)
+    row["observation"] = after["observation"]
+    path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="HISTORY_UNAVAILABLE"):
+        brain.tools.invoke("history", {})
+
+
+def test_archived_state_is_detached_and_inspect_uses_historical_state(brain_factory):
+    brain = brain_factory([play()])
+    obs = observation()
+    original = deepcopy(obs["observation"])
+    decide(brain, obs)
+    obs["observation"]["shoulder_rad"] = 9.0
+    copy = brain.storage.frame_info("f000000")
+    copy["observation"]["elbow_rad"] = 9.0
+    after = observation(1)
+    after["observation"]["shoulder_rad"] = 0.7
+    brain.accept_batch_result(receipt(brain), after)
+    result, images = brain.tools.invoke("inspect", {"question": "旧状态", "views": [
+        {"label": "初始图", "frame_id": "f000000"}]})
+    assert images[0][0]["observation"] == original
+    assert images[0][0]["timestamp_s"] == 0.0
+    assert "observation" not in result["data"]["views"][0]
+    assert brain.storage.current_frame_id == "f000001"
+    assert lines(brain.storage.episode_dir / "frame_index.jsonl")[0]["observation"] == original
+
+
+@pytest.mark.parametrize("field,value", [("shoulder_rad", float("nan")), ("elbow_rad", True),
+                                         ("base_v_mps", float("inf")), ("base_w_radps", "0"),
+                                         ("gripper_opening", 1.1)])
+def test_invalid_measurements_are_not_published(brain_factory, field, value):
+    brain = brain_factory([])
+    obs = observation()
+    obs["observation"][field] = value
+    with pytest.raises(RuntimeError, match="OBSERVATION_UNAVAILABLE"):
+        brain.storage.archive(obs, None)
+    assert brain.storage.current_frame_id is None
+    assert not list((brain.storage.episode_dir / "frames").iterdir())
+
+
+@pytest.mark.parametrize("change", ["state", "timestamp", "missing"])
+def test_same_pixels_cannot_hide_changed_or_missing_measurements(brain_factory, change):
+    brain = brain_factory([])
+    obs = observation()
+    brain.storage.archive(obs, None)
+    if change == "state":
+        obs["observation"]["shoulder_rad"] += 0.1
+    elif change == "timestamp":
+        obs["timestamp_s"] += 0.1
+    else:
+        del obs["observation"]
+    with pytest.raises(RuntimeError):
+        brain.storage.check_observation(obs)
 
 
 def test_multitool_play_feedback_memory_and_second_decision(brain_factory):
@@ -235,6 +363,20 @@ def test_entire_action_batch_is_validated_before_handoff(brain_factory, action):
     assert [decision.tool for decision in decisions] == ["done"]
     assert results(brain)["play"]["ok"] is False
     assert brain.next_batch_id == 1 and brain.storage.history()["batches"] == []
+
+
+@pytest.mark.parametrize("joint", ["shoulder", "elbow"])
+def test_joint_nudges_are_hidden_and_rejected_before_any_batch_handoff(brain_factory, joint):
+    brain = brain_factory([play(actions=[{"action": "forward", "args": {"seconds": 0.1}},
+                                        {"action": joint, "args": {"delta": 0.1}}]), finish()])
+    decisions = decide(brain)
+    assert [decision.tool for decision in decisions] == ["done"]
+    assert results(brain)["play"]["error"]["code"] == "ACTION_DISABLED"
+    schema = brain.tools.parameters["play"]["properties"]["actions"]["items"]["oneOf"]
+    available = {item["properties"]["action"]["enum"][0] for item in schema}
+    assert not {"shoulder", "elbow"} & available
+    assert "arm_pose" in available
+    assert brain.storage.history()["batches"] == []
 
 
 def test_handoff_mix_and_call_limit_never_execute_group(brain_factory):

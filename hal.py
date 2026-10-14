@@ -4,7 +4,7 @@ control/ 包只依赖本文件定义的接口 —— 不 import mujoco.
 - RobotInterface: 低层命令(轮速/臂舵机/手指) + 状态读取 + 车头相机 + 时间
 - WorldInterface: 任务判定 (真值, 仅用于评估, 大脑不可见)
 
-感知约定: 大脑只能通过 front_image() 拿到相机图像, 没有任何物体真值坐标.
+感知约定: 大脑接收车头图像与白名单本体状态, 没有任何物体真值坐标.
 """
 
 from __future__ import annotations
@@ -25,6 +25,14 @@ class RobotInterface(ABC):
     @abstractmethod
     def base_pose(self) -> np.ndarray:
         """底盘位姿 (x, y, yaw) —— 里程计."""
+
+    @property
+    @abstractmethod
+    def base_velocity(self) -> np.ndarray:
+        """实测 [v, w] (m/s, rad/s)，底盘原点、车体坐标系 +x 前进/+z 左转。
+
+        真机由传感器/里程计提供；不能返回 command_drive 的目标命令。
+        """
 
     @property
     @abstractmethod

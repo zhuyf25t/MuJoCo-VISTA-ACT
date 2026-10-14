@@ -1,6 +1,6 @@
 """仿真环境: 组装 MuJoCo 后端 + 控制驱动, 提供兼容门面.
 
-感知约定: 大脑只能经 hal.front_image() 看车头相机; env.success() 用真值,
+感知约定: 大脑接收车头相机与白名单本体状态; env.success() 用真值,
 仅在回合结束时判定, 不进入任何决策路径.
 """
 
@@ -39,6 +39,10 @@ class SimRobotFacade:
     @property
     def base_pose(self) -> np.ndarray:
         return self.hal.base_pose
+
+    @property
+    def base_velocity(self) -> np.ndarray:
+        return self.hal.base_velocity
 
     @property
     def arm_q(self) -> np.ndarray:
@@ -140,12 +144,25 @@ class MobileManipEnv:
 
     # ---------- 观测 / 评估 ----------
     def get_obs(self, images: dict | None = None) -> dict:
+        """同一仿真时刻的图像和状态；调用期间不推进物理。
+
+        若传入 images，调用方须保证它来自当前时刻。
+        """
         r = self.robot
+        images = images if images is not None else {"front": self.hal.front_image()}
+        v, w = r.base_velocity
+        shoulder, elbow = r.arm_q
+        opening = r.finger_opening
         return {
-            "images": images if images is not None
-            else {"front": self.hal.front_image()},
-            "arm_qpos": r.arm_q.tolist(),
-            "finger": r.finger_opening,
+            "images": images,
+            "timestamp_s": self.hal.now(),
+            "observation": {
+                "shoulder_rad": float(shoulder), "elbow_rad": float(elbow),
+                "gripper_opening": opening,
+                "base_v_mps": float(v), "base_w_radps": float(w),
+            },
+            "arm_qpos": [float(shoulder), float(elbow)],
+            "finger": opening,
             "base_pose": r.base_pose.tolist(),
             "tcp_pos": r.tcp_pos.tolist(),
         }
