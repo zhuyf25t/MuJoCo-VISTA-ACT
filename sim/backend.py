@@ -1,12 +1,14 @@
 """MuJoCo 仿真后端: 实现 hal 抽象接口 (MjRobot / MjWorld).
 
 所有 mujoco 读写、物理步进、车头相机渲染与"运动学吸附"封闭在本模块.
-自动吸附规则(参考车 try_grasp 的机制): 手指闭合且球距 TCP < GRASP_DIST
-→ 吸附; 手指张开 → 释放. 这是物理抓取的仿真等效实现, 对大脑只暴露
-"持有/未持有"状态, 不暴露任何球坐标.
+闭爪动作期间，实测开度稳定且同一球持续接触两侧指垫内表面后，才启用
+辅助吸附；开爪或持续失去有效夹持时释放。候选及吸附状态留在后端，
+VISTA 仍通过图像和实测关节开度判断持球。
 """
 
 from __future__ import annotations
+
+from collections import deque
 
 import mujoco
 import numpy as np
@@ -36,9 +38,17 @@ class MjRobot(RobotInterface):
         self.j_sh = m.joint(config.JOINT_SHOULDER).qposadr[0]
         self.j_el = m.joint(config.JOINT_ELBOW).qposadr[0]
         self._ball_ids = {n: m.body(n).id for n in config.BALL_NAMES}
+        self._ball_geoms = {m.geom(f"{n}_geom").id: n for n in config.BALL_NAMES}
+        # 指垫局部 y 轴上的内表面方向：活动左指 -y，固定右指 +y。
+        self._finger_geoms = {m.geom(f"{config.ARM_PREFIX}left_finger_geom").id: -1,
+                              m.geom(f"{config.ARM_PREFIX}right_finger_geom").id: 1}
         self._scratch = mujoco.MjData(model)
         self._measure_arm()
         self._attach: tuple[str, np.ndarray] | None = None
+        self._grasp_attempt_active = False
+        self._grasp_candidate: str | None = None
+        self._grasp_samples: deque[tuple[float, float]] = deque()
+        self._grasp_lost_since: float | None = None
         self._front_renderer = None
         self._front_cam_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_CAMERA,
                                                config.CAM_FRONT)
@@ -122,6 +132,11 @@ class MjRobot(RobotInterface):
 
     def command_finger(self, goal_ctrl: float) -> None:
         self.data.ctrl[self.i_act_fi] = float(goal_ctrl)
+        if goal_ctrl < config.FINGER_CLOSED_THRESHOLD:
+            self.detach_object()  # 开爪立即解除，不等下一次接触检测。
+        else:
+            self.finish_grasp_attempt()
+            self._grasp_attempt_active = self._attach is None
 
     def finger_ctrl_range(self) -> tuple[float, float]:
         rng = self.model.actuator_ctrlrange[self.i_act_fi]
@@ -153,50 +168,102 @@ class MjRobot(RobotInterface):
         if on_tick:
             on_tick()
 
-    # ================= 自动吸附 (物理抓取的仿真等效) =================
-    def _finger_ball_contacts(self, ball_bid: int) -> int:
-        """手指 pad 与指定球之间的接触数."""
-        n = 0
-        for i in range(self.data.ncon):
-            c = self.data.contact[i]
-            g1 = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, c.geom1) or ""
-            g2 = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, c.geom2) or ""
-            hit = False
-            if "finger" in g1 and self.model.geom_bodyid[c.geom2] == ball_bid:
-                hit = True
-            elif "finger" in g2 and self.model.geom_bodyid[c.geom1] == ball_bid:
-                hit = True
-            if hit:
-                n += 1
-        return n
+    # ================= 确认夹持后的辅助吸附 =================
+    def _is_inner_pad_contact(self, contact, finger: int) -> bool:
+        """接触须位于指垫内表面；排除外侧、指尖及背面碰撞。"""
+        rotation = self.data.geom_xmat[finger].reshape(3, 3)
+        point = rotation.T @ (contact.pos - self.data.geom_xpos[finger])
+        normal = rotation.T @ contact.frame[:3]
+        half = self.model.geom_size[finger]
+        tol = config.GRASP_CONTACT_TOL_M
+        return bool(abs(point[1] - self._finger_geoms[finger] * half[1]) <= tol
+                    and abs(point[0]) <= half[0] + tol
+                    and abs(point[2]) <= half[2] + tol
+                    and abs(normal[1]) >= config.GRASP_NORMAL_COS_MIN)
+
+    def _valid_grasp_balls(self) -> set[str]:
+        opening = self.finger_opening
+        if not config.GRASP_OPENING_MIN < opening < config.GRASP_OPENING_MAX:
+            return set()
+        sides: dict[str, set[int]] = {}
+        for contact in self.data.contact:
+            g1, g2 = contact.geom1, contact.geom2
+            if g1 in self._finger_geoms and g2 in self._ball_geoms:
+                finger, ball = g1, g2
+            elif g2 in self._finger_geoms and g1 in self._ball_geoms:
+                finger, ball = g2, g1
+            else:
+                continue
+            if contact.efc_address < 0 or not self._is_inner_pad_contact(contact, finger):
+                continue
+            # 用左右指垫的 ID 去重：同侧多个接触点不能伪装成双侧接触。
+            sides.setdefault(self._ball_geoms[ball], set()).add(finger)
+        tcp = self.data.site_xpos[self.i_tcp]
+        return {name for name, fingers in sides.items()
+                if len(fingers) == 2
+                and np.linalg.norm(self.data.xpos[self._ball_ids[name]] - tcp) <= config.GRASP_DIST}
+
+    def _clear_grasp_candidate(self) -> None:
+        self._grasp_candidate = None
+        self._grasp_samples.clear()
+
+    def finish_grasp_attempt(self) -> None:
+        self._grasp_attempt_active = False
+        self._clear_grasp_candidate()
 
     def _auto_grasp(self) -> None:
-        """手指闭合 + 球在夹爪附近 + **pad 物理接触** → 持有.
-        接触检测是必须的: 球必须在两指之间被实际夹住, 而非隔空吸附."""
-        closed = self.data.ctrl[self.i_act_fi] >= config.FINGER_CLOSED_THRESHOLD
+        """只在显式抓取尝试中获取对象；持续复核已确认的夹持。"""
+        if self.data.ctrl[self.i_act_fi] < config.FINGER_CLOSED_THRESHOLD:
+            self.detach_object()
+            return
+        if self._attach is None and not self._grasp_attempt_active:
+            return
+        # mj_step 已推进 qpos；刷新接触和几何，避免与上一步的派生量混用。
+        mujoco.mj_forward(self.model, self.data)
         if self._attach is not None:
-            if not closed:
-                self._attach = None
+            # 已确认的辅助约束先跟上当前臂姿态，再复核接触；否则会把球
+            # 尚在上一物理步的位置造成的短暂间隙误判为运输中失去夹持。
+            self._apply_attach()
+            mujoco.mj_forward(self.model, self.data)
+        valid = self._valid_grasp_balls()
+        now = self.now()
+        if self._attach is not None:
+            if self._attach[0] in valid:
+                self._grasp_lost_since = None
+            elif self._grasp_lost_since is None:
+                self._grasp_lost_since = now
+            elif now - self._grasp_lost_since >= config.GRASP_LOSS_SECONDS - 1e-9:
+                self.detach_object()
             return
-        if not closed:
+        candidate = next((name for name in self._ball_ids if name in valid), None)
+        if candidate is None:
+            self._clear_grasp_candidate()
             return
-        tcp = self.data.site_xpos[self.i_tcp]
-        for name, bid in self._ball_ids.items():
-            if np.linalg.norm(self.data.xpos[bid] - tcp) > config.GRASP_DIST:
-                continue
-            # 必须有手指 pad 与球的物理接触(≥1 个接触点)
-            if self._finger_ball_contacts(bid) >= 1:
-                self.attach_object(name)
-                return
+        if candidate != self._grasp_candidate:
+            self._clear_grasp_candidate()
+            self._grasp_candidate = candidate
+        self._grasp_samples.append((now, self.finger_opening))
+        cutoff = now - config.GRASP_STABLE_SECONDS
+        while len(self._grasp_samples) > 1 and self._grasp_samples[1][0] <= cutoff:
+            self._grasp_samples.popleft()
+        elapsed = now - self._grasp_samples[0][0]
+        openings = [sample[1] for sample in self._grasp_samples]
+        if (elapsed >= config.GRASP_STABLE_SECONDS - 1e-9
+                and max(openings) - min(openings) <= config.GRASP_OPENING_TOL):
+            self.attach_object(candidate)
 
     def attach_object(self, name: str) -> None:
         g = self.i_grip_body
         gmat = np.array(self.data.xmat[g]).reshape(3, 3)
         relpos = gmat.T @ (self.data.xpos[self.model.body(name).id] - self.data.xpos[g])
         self._attach = (name, relpos)
+        self._grasp_lost_since = None
+        self.finish_grasp_attempt()
 
     def detach_object(self) -> None:
         self._attach = None
+        self._grasp_lost_since = None
+        self.finish_grasp_attempt()
 
     def attached_object(self) -> str | None:
         return self._attach[0] if self._attach is not None else None

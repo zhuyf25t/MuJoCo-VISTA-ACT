@@ -141,8 +141,12 @@ class ArmDriver:
     def _finger(self, goal: float, on_tick: TickCallback | None) -> tuple[bool, str]:
         lo, hi = self.r.finger_ctrl_range()
         goal = float(np.clip(goal, lo, hi))
-        self.r.command_finger(goal)
-        self.r.step_ticks(8, on_tick)                # 0.8 s 行程 + 稳定
+        try:
+            self.r.command_finger(goal)
+            self.r.step_ticks(8, on_tick)            # 保持固定 0.8 s，不自动延长
+        finally:
+            # 即使回调中断，也不能在后续移动时突然获取新吸附对象。
+            self.r.finish_grasp_attempt()
         state = "闭合" if goal >= config.FINGER_CLOSED_THRESHOLD else "张开"
         held = self.r.attached_object() is not None
         if goal >= config.FINGER_CLOSED_THRESHOLD:

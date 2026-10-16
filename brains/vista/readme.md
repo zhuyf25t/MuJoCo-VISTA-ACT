@@ -8,7 +8,9 @@
 
 相邻两次 play 之间只采集一次观测：`O0 → play A → O1 → play B → O2`。A 的 after 和 B 的 before 共用 O1 的 frame_id；下一次 `decide()` 只校验已有观测，不再次拍照或追加。每次请求发送累计历史，里面包含过去的观测消息；这不代表重新采样。新状态写在图片旁的 HumanMessage 文本中，不再复制进同一批 play 的 ToolMessage。主动 `inspect` 时可再次看到对应原图的状态，且不会改写当前观测；主动查询 `history` 则返回各已结算批次的执行前 `observation`。
 
-当前临时策略仍禁止肩/肘单关节微调：`shoulder`、`elbow` 保留底层实现，但不出现在模型的 play 动作 Schema 中；即使模型自行提交也返回 `ACTION_DISABLED`，整批不执行。手臂只允许 `arm_pose` 四种预设。读取关节状态不等于开放自由控制。解除限制时须同步修改 `DISABLED_ACTIONS` 与 system prompt。
+当前支持 `arm_pose` 四种预设及 `shoulder`、`elbow` 单关节微调，提示词与 play 动作 Schema 一致。微调参数 `delta` 是相对当前实测角的增量（rad），按 `ARM_NUDGE_MAX` 限幅（当前为 ±0.5）；超出范围的请求会在整批交接前被拒绝。
+
+预设优先覆盖正常流程：`stow` 空爪看图对齐，`reach` 地面抓取，`carry=[0.95,1.10]` 抬高验球及运输，`drop=[1.10,0.79]` 平顺前伸投放（角度为肩、肘，单位 rad）。两种持球姿态的 TCP 高度均约 0.31 m，前伸量约 0.67 / 0.72 m；前伸相对底盘中心，高度相对地面，不是球心或相机距离。球顶部可能部分出画，不代表掉球，仍须直接核对夹持关系与离地。提示词保留固定相机的抓取参考：320×240 原图中，地面球心约 `(160,110)`、直径约 `44px`，先 stow 对齐再 reach；这不是当前球的位置真值。数值在 `config.py` 与 `prompts/system.txt` 同步维护；切到 drop 仍需用底盘对准箱口、停稳后释放，姿态名称不表示持球或投放已成功。物理标定与回归见 `tests/test_arm_presets.py`，包括运输和姿态过渡的球底余量检查。
 
 **State 只保留 `messages`、`model_calls` 两个字段。** 有效 play 经条件边到 END，外层执行动作；无法继续的异常直接 raise，最外层打印说明并以退出码 1 结束整个程序。动作和预期已在 AIMessage 中，工具结果另建 ToolMessage；只核对当前轮的配对，不另存动作副本或停止原因。模型调用上限从 `max_model_calls` 配置读取。
 
@@ -87,7 +89,7 @@ mujoco/
 | `graph.py`、`state.py` | model/tools 循环、消息累计、调用预算、工具请求与结果配对 | 新环境是否继续采用 play 提交批次、外层回传结果的约定 |
 | `model.py` | 文本/图片/工具消息转换和模型请求 | 当前仅适配 OpenAI 兼容 Chat Completions；换 API 协议需要另写适配 |
 | `brain.py` | 同一 episode 的上下文延续、动作交接和结果接回 | 本项目的 Brain/Decision 接口、车头观察格式和结束判定 |
-| `tools.py` | 查图、读像素、history、笔记读写及参数检查 | 十个底层动作的定义，以及 `DISABLED_ACTIONS` 临时限制（当前向模型开放八个动作） |
+| `tools.py` | 查图、读像素、history、笔记读写及参数检查 | 十个底层动作的定义与参数范围 |
 | `storage.py`、`settings.py` | PNG/实测快照归档、笔记作用域、JSONL 日志、预算和长度配置 | `images.front`、五维状态白名单、时间戳约定，以及项目 config 和默认路径 |
 
 `prompts/system.txt`、外层 `run_collect.py` 和 `control/tools.py` 当前承担具体任务和环境的适配，因此没有把它们整体标为通用。提示词中的查图、记笔记、提交批次等协议可以沿用，但车头相机、抓球任务和机器人动作说明需要随环境调整。迁移时主要替换**观察入口、动作定义与执行器、任务提示词**，通常不必重写 LangGraph 的两个节点和转移边。

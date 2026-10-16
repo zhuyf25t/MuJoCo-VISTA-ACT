@@ -40,8 +40,15 @@ BODY_ARM_BASE = f"{ARM_PREFIX}arm_base"
 # 指滑动 ctrl: 0 = 全开, 0.015 = 轻贴球面
 FINGER_OPEN_CTRL = 0.0
 FINGER_CLOSE_CTRL = 0.05    # 满行程闭合: 左指面到+0.027, 与固定右指(-0.077)夹住0.12m球; 行程不足时正对球差2mm永远无接触
-FINGER_CLOSED_THRESHOLD = 0.008   # ctrl 超过此值视为"已闭合"(自动吸附条件)
+FINGER_CLOSED_THRESHOLD = 0.008   # 仅识别闭爪命令意图，不代表手指实际闭合
 GRASP_DIST = 0.15                 # 球心距 TCP 此距离内才做接触检测(预筛)
+GRASP_CONTACT_TOL_M = 0.003        # 指垫内表面接触位置容差
+GRASP_NORMAL_COS_MIN = 0.7        # 接触法向须主要沿指垫内表面法向
+GRASP_OPENING_MIN = 0.05
+GRASP_OPENING_MAX = 0.45
+GRASP_STABLE_SECONDS = 0.1        # 同一个球连续双侧接触的确认窗口
+GRASP_OPENING_TOL = 0.02          # 窗口内实测开度极差（对应 1 mm 行程）
+GRASP_LOSS_SECONDS = 0.1          # 持续失去有效夹持后解除辅助吸附
 
 # ---- 相机 (车头前向, 唯一的"眼睛") ----
 CAM_FRONT = "front_cam"
@@ -73,11 +80,12 @@ PRIM_MAX_S = 3.0       # 单次命令最长秒数
 ARM_NUDGE_MAX = 0.5    # shoulder/elbow 单次微调最大弧度
 
 # ---- 臂预设姿态 [肩, 肘] ----
-ARM_STOW = [0.15, -0.6]      # 行驶收纳
-ARM_CARRY = [0.55, -1.1]     # 持球携带 (高位)
-ARM_REACH = [1.15, 1.46]     # 前伸抓取 (TCP≈前方0.55m, 离地0.11m)
-# 投放使用高肘分支：肘部约高0.64m，夹爪朝前下方；TCP仍≈前方0.55m、高0.50m。
-ARM_DROP = [0.48503, 1.44]
+# 同一正肘分支，避免收放时绕过高位；以下为真实伺服稳定后的近似 TCP 位置。
+# 前伸量相对底盘中心，高度相对地面；球心随实际夹取位置变化，不等于 TCP。
+ARM_STOW = [0.0, 2.2]       # 空爪折叠，车头视野畅通；TCP≈前0.32m、高0.44m
+ARM_REACH = [1.13, 1.47]    # 地面抓取；TCP≈前0.54m、高0.10m，指尖离地≈0.055m
+ARM_CARRY = [0.95, 1.10]    # 抬高持球/运输；TCP≈前0.67m、高0.31m，球顶部可能部分出画
+ARM_DROP = [1.10, 0.79]     # 平顺前伸投放；TCP≈前0.72m、高0.31m，仍需底盘对准箱口
 
 # ---- 任务场景 ----
 BALL_NAMES = ["ball_0", "ball_1", "ball_2", "ball_3"]

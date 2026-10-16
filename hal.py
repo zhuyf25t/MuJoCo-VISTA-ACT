@@ -105,9 +105,12 @@ class RobotInterface(ABC):
             self.tick(on_tick)
 
     # ---------- 夹持感知 ----------
-    # 指闭合且物体在夹爪内 → 后端登记"持有"; 张开 → 释放.
-    # 仿真: 闭合+球在 TCP 0.22m 内 = 运动学吸附(物理抓取的等效实现);
-    # 真机: 力/电流传感器判断, 吸附/解除只是登记状态.
+    # 闭爪命令开启一次抓取尝试；稳定双侧夹持后才启用仿真辅助。
+    # 动作结束关闭尝试，保留已确认的夹持；开爪/reset 清空全部抓取状态。
+    @abstractmethod
+    def finish_grasp_attempt(self) -> None:
+        """结束本次抓取判定，清空候选；不解除已经确认的夹持。"""
+
     @abstractmethod
     def attach_object(self, name: str) -> None:
         """按当前夹爪-物体相对位姿吸附物体."""

@@ -366,16 +366,17 @@ def test_entire_action_batch_is_validated_before_handoff(brain_factory, action):
 
 
 @pytest.mark.parametrize("joint", ["shoulder", "elbow"])
-def test_joint_nudges_are_hidden_and_rejected_before_any_batch_handoff(brain_factory, joint):
-    brain = brain_factory([play(actions=[{"action": "forward", "args": {"seconds": 0.1}},
-                                        {"action": joint, "args": {"delta": 0.1}}]), finish()])
+@pytest.mark.parametrize("delta", [-0.5, 0.1, 0.5])
+def test_joint_nudges_are_exposed_and_handed_off_with_their_delta(brain_factory, joint, delta):
+    actions = [{"action": "forward", "args": {"seconds": 0.1}},
+               {"action": joint, "args": {"delta": delta}}]
+    brain = brain_factory([play(actions=actions)])
     decisions = decide(brain)
-    assert [decision.tool for decision in decisions] == ["done"]
-    assert results(brain)["play"]["error"]["code"] == "ACTION_DISABLED"
+    assert [{"action": decision.tool, "args": decision.args} for decision in decisions] == actions
+    assert brain.handoff()["args"]["actions"] == actions
     schema = brain.tools.parameters["play"]["properties"]["actions"]["items"]["oneOf"]
     available = {item["properties"]["action"]["enum"][0] for item in schema}
-    assert not {"shoulder", "elbow"} & available
-    assert "arm_pose" in available
+    assert {"shoulder", "elbow", "arm_pose"} <= available
     assert brain.storage.history()["batches"] == []
 
 
@@ -902,7 +903,7 @@ def test_closing_gui_during_settling_stops_physics_and_keeps_partial_record(brai
     assert len(lines(tmp_path / "collector/trajectory.jsonl")) == 3
 
 
-def test_recorded_drop_passes_after_settling_without_extra_model_actions(brain_factory, tmp_path):
+def test_recorded_drop_passes_after_settling_without_extra_model_actions(brain_factory, tmp_path, monkeypatch):
     """Reproduce ep_0018's released-but-still-rolling ball using its action sequence."""
     import config
     import h5py
@@ -910,6 +911,15 @@ def test_recorded_drop_passes_after_settling_without_extra_model_actions(brain_f
     from recorder import DatasetStore
     from run_collect import run_episode
     from sim.env import MobileManipEnv
+    from control.drivers import ArmDriver
+
+    # This historical action sequence depends on the original high carry/drop.
+    # Freeze its calibration so it keeps testing the unsettled -> settled result;
+    # current presets have separate real-physics coverage in test_arm_presets.py.
+    recorded_presets = {"stow": [0.15, -0.6], "reach": [1.15, 1.46],
+                        "carry": [0.55, -1.1], "drop": [0.48503, 1.44]}
+    monkeypatch.setattr(config, "ARM_STOW", recorded_presets["stow"])
+    monkeypatch.setattr(ArmDriver, "_PRESETS", recorded_presets)
 
     actions = [
         ("forward", {"seconds": 1.0}), ("forward", {"seconds": 1.5}),
@@ -929,7 +939,7 @@ def test_recorded_drop_passes_after_settling_without_extra_model_actions(brain_f
         env.reset(seed=0)
         outcome = run_episode(env, brain, SCHEMAS, TASK, tmp_path / "collector",
                               save_images=True, verbose=False, dataset=dataset)
-        np.testing.assert_allclose(env.data.ctrl[env.hal.i_act_arm], config.ARM_DROP)
+        np.testing.assert_allclose(env.data.ctrl[env.hal.i_act_arm], recorded_presets["drop"])
         assert env.data.ctrl[env.hal.i_act_fi] == config.FINGER_OPEN_CTRL
         assert env.success() is True
     assert outcome["settling"]["environment_success_before"] is False

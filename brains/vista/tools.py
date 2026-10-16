@@ -16,10 +16,6 @@ from .state import validate_reply
 from .storage import VistaStorage
 
 
-# Temporary VISTA policy: measurements are visible, but arm motion uses presets only.
-DISABLED_ACTIONS = frozenset({"shoulder", "elbow"})
-
-
 class _Arguments(ValueError):
     def __init__(self, code, message, hint="请根据工具说明修改参数"):
         super().__init__(message)
@@ -150,8 +146,6 @@ def tool_schemas(settings: VistaSettings, actions: dict) -> list[dict]:
                                        "items": _object(pixel_view, pixel_view.keys())}}, ("question", "views"))
     action_variants = []
     for name, definition in actions.items():
-        if name in DISABLED_ACTIONS:
-            continue
         action_variants.append(_object({"action": {"type": "string", "enum": [name],
                                                    "description": definition["description"]},
                                          "args": definition["parameters"]}, ("action", "args")))
@@ -180,7 +174,7 @@ def tool_schemas(settings: VistaSettings, actions: dict) -> list[dict]:
         ("read_working", "读取当前计划、假设、预期和未决问题。" + working_scope, _object({})),
         ("write_working", "完整替换本次实验草稿，不会修改历史事实。" + working_scope,
          _object({"content": _text("完整新版草稿", settings.max_working_chars)}, ("content",))),
-        ("play", "提交一批按数组顺序连续执行的动作；肩/肘单关节微调暂时禁用，手臂仅可用 arm_pose 预设。"
+        ("play", "提交一批按数组顺序连续执行的动作，支持 arm_pose 预设和 shoulder/elbow 单关节微调。"
          "批内不再调用模型，结束后反馈最终图及同一时刻的 observation 实测状态。"
          "history 本批 observation 记录的是执行前状态。必须独占本条模型回复；expectation 是整批预期，不是成功证明。",
          _object({"actions": {"type": "array", "minItems": 1, "maxItems": settings.max_actions,
@@ -246,11 +240,6 @@ class VistaTools:
                         raise _Arguments("INVALID_ACTION", "play.actions 不能为空")
                     if len(actions) > self.settings.max_actions:
                         raise _Arguments("ACTION_LIMIT", f"每批最多 {self.settings.max_actions} 个动作")
-                    if any(isinstance(action, dict) and isinstance(action.get("action"), str)
-                           and action["action"] in DISABLED_ACTIONS
-                           for action in actions):
-                        raise _Arguments("ACTION_DISABLED", "shoulder/elbow 单关节微调暂时禁用，整批未执行",
-                                         "手臂请使用 arm_pose 的 stow/carry/reach/drop 预设")
             try:
                 _check(self.parameters[name], args)
             except _Arguments as error:

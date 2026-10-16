@@ -110,7 +110,7 @@ class ToolLayer:
         add(Tool("turn_left", "底盘原地左转(逆时针)", {"seconds": _s("左转时长")}, [], turn_left))
         add(Tool("turn_right", "底盘原地右转(顺时针)", {"seconds": _s("右转时长")}, [], turn_right))
         add(Tool("arm_pose",
-                 "臂到预设姿态: stow=行驶收纳 / carry=持球携带 / reach=前伸到地面抓取位 / drop=高位投放位",
+                 "臂到预设姿态: stow=空爪收纳 / reach=地面抓取 / carry=抬高验球及携带，球顶部可能部分出画 / drop=前伸投放，需底盘对准箱口",
                  {"pose": _p("stow|carry|reach|drop", ptype="string")}, ["pose"], arm_pose))
         add(Tool("shoulder",
                  "肩关节角度微调：零位时上臂向上，从零位向车头倾转为正向。夹爪升降取决于当前肩、肘姿态。",
