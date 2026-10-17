@@ -120,8 +120,6 @@ def action_schemas(tool_schemas: list[dict]) -> dict[str, dict]:
         elif name in ("shoulder", "elbow"):
             schema["properties"]["delta"].update(
                 minimum=-config.ARM_NUDGE_MAX, maximum=config.ARM_NUDGE_MAX)
-        elif name == "close_gripper":
-            description = "闭合夹爪；指令完成不表示抓到球，必须用后续图像判断。"
         definitions[name] = {"description": description, "parameters": schema}
     if set(definitions) != names:
         raise RuntimeError("VISTA 需要完整的十个控制动作定义，请传入 ToolLayer 的工具 Schema")

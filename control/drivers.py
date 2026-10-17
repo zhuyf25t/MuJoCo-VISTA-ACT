@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+from math import ceil
+
 import numpy as np
 
 import config
@@ -20,6 +22,10 @@ class ActionFailed(Exception):
     All executed ticks completed normally. The command was applied; this is
     recoverable from a fresh observation, unlike an exception during a tick.
     """
+
+
+class GraspNotConfirmed(ActionFailed):
+    """The close action finished, but stable grasp was not confirmed."""
 
 
 def wrap_angle(a: float) -> float:
@@ -141,18 +147,21 @@ class ArmDriver:
     def _finger(self, goal: float, on_tick: TickCallback | None) -> tuple[bool, str]:
         lo, hi = self.r.finger_ctrl_range()
         goal = float(np.clip(goal, lo, hi))
+        closing = goal >= config.FINGER_CLOSED_THRESHOLD
         try:
+            if closing:
+                self.r.command_drive(0.0, 0.0)
             self.r.command_finger(goal)
-            self.r.step_ticks(8, on_tick)            # 保持固定 0.8 s，不自动延长
+            # One uninterrupted attempt, with a fixed duration even if grasp
+            # confirms early. Preserve the arm target and record every tick.
+            ticks = ceil(config.GRIPPER_CLOSE_SECONDS / config.CTRL_DT) if closing else 8
+            self.r.step_ticks(ticks, on_tick)
         finally:
             # 即使回调中断，也不能在后续移动时突然获取新吸附对象。
             self.r.finish_grasp_attempt()
-        state = "闭合" if goal >= config.FINGER_CLOSED_THRESHOLD else "张开"
         held = self.r.attached_object() is not None
-        if goal >= config.FINGER_CLOSED_THRESHOLD:
-            # 闭合: 明确反馈抓取成败, 模型据此决定重试或继续
+        if closing:
             if held:
-                return True, "手指已闭合, ✓ 成功夹到球!"
-            return True, ("手指已闭合, ✗ 没有夹到球. "
-                          "按结果里的'夹爪视角'小步修正(0.2~0.3s)后重试抓取序列")
-        return True, f"手指已{state}" + (", 球已释放" if not held else "")
+                return True, "闭爪完成，已通过稳定夹持判定；抬臂后仍须看图确认离地与夹持关系"
+            raise GraspNotConfirmed("闭爪结束，未确认稳定夹持；保持闭合目标，不能据此认定持球或抬臂")
+        return True, "手指已张开" + (", 球已释放" if not held else "")

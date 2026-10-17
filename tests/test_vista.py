@@ -725,6 +725,107 @@ def test_blocked_arm_recovers_without_stopping_collection(brain_factory, monkeyp
     assert [entry["status"] for entry in manifest["episodes"]] == ["rejected", "rejected"]
 
 
+@pytest.mark.parametrize("seed,confirmed", [(1, True), (2, False)])
+@pytest.mark.parametrize("closes", [1, 2])
+def test_recorded_close_uses_12_ticks_and_blocks_carry_when_unconfirmed(
+        brain_factory, tmp_path, monkeypatch, seed, confirmed, closes):
+    import mujoco
+    import config
+    from run_collect import run_episode
+    from sim.env import MobileManipEnv
+
+    states = json.loads((Path(__file__).parent / "fixtures/grasp_settling_before_close.json")
+                        .read_text(encoding="utf-8"))["states"]
+    state = next(row for row in states if row["seed"] == seed)
+    first_confirmed = confirmed
+    confirmed = confirmed or closes == 2
+    actions = [{"action": "close_gripper", "args": {}} for _ in range(closes)]
+    actions.append({"action": "arm_pose", "args": {"pose": "carry"}})
+    brain = brain_factory([play(actions=actions),
+                           finish()], begin=False)
+    monkeypatch.setattr(config, "EPISODE_SETTLE_SECONDS", 0)
+    source = tmp_path / "collector"
+    with MobileManipEnv() as env:
+        env.reset(seed=seed)
+        env.data.time = state["t"]
+        for field in ("qpos", "qvel", "ctrl"):
+            getattr(env.data, field)[:] = state[field]
+        mujoco.mj_forward(env.model, env.data)
+        initial_arm_target = env.data.ctrl[env.hal.i_act_arm].copy()
+        run_episode(env, brain, SCHEMAS, TASK, source, save_images=False, verbose=False)
+        assert (env.hal.attached_object() is not None) is confirmed
+        assert not env.hal._grasp_attempt_active
+        if not confirmed:
+            np.testing.assert_array_equal(env.data.ctrl[env.hal.i_act_arm], initial_arm_target)
+        env.hal.step_ticks(20)
+        assert (env.hal.attached_object() is not None) is confirmed
+
+    rows = lines(source / "trajectory.jsonl")
+    close_rows = [row for row in rows if row["t"] < state["t"] + 1.2 * closes - 1e-6]
+    assert len(close_rows) == 12 * closes
+    np.testing.assert_allclose([row["t"] - state["t"] for row in close_rows], np.arange(12 * closes) * 0.1,
+                               atol=1e-8)
+    np.testing.assert_allclose([row["t_end"] - row["t"] for row in close_rows], 0.1)
+    np.testing.assert_allclose([row["action"] for row in close_rows],
+                               np.tile([*initial_arm_target, 0, 0, 0], (12 * closes, 1)))
+    record = lines(brain.storage.episode_dir / "actions.jsonl")[0]
+    assert [row["status"] for row in record["action_results"]] == (
+        ["completed" if first_confirmed else "failed"] + ["completed"] * (closes - 1)
+        + ["completed" if confirmed else "not_executed"])
+    assert record["action_results"][0]["action_applied"] is True
+    assert len(brain.model.requests) == 2  # Recoverable failure returns to the model.
+    if not confirmed:
+        assert len(rows) == 12  # No carry ticks were executed.
+        error = record["action_results"][0]["error"]
+        assert error["code"] == "GRASP_NOT_CONFIRMED"
+        assert "未确认稳定夹持" in error["message"]
+        feedback = json.dumps(api_messages(brain.model.requests[1]["messages"], "test"), ensure_ascii=False)
+        assert "GRASP_NOT_CONFIRMED" in feedback and "未确认稳定夹持" in feedback
+    if not first_confirmed and closes == 2:
+        assert record["execution_status"] == "partial"  # Preserve the first failure honestly.
+        error = record["action_results"][0]["error"]
+        assert error["code"] == "GRASP_NOT_CONFIRMED"
+        assert "第二次回执" in error["message"] and "后续动作未执行" not in error["message"]
+
+
+@pytest.mark.parametrize("requested_closes", [2, 3])
+def test_empty_close_pair_stops_after_two_and_never_lifts(brain_factory, tmp_path, monkeypatch, requested_closes):
+    import config
+    from run_collect import run_episode
+    from sim.env import MobileManipEnv
+    actions = [{"action": "close_gripper", "args": {}} for _ in range(requested_closes)]
+    actions.append({"action": "arm_pose", "args": {"pose": "carry"}})
+    brain = brain_factory([play(actions=actions), finish()], begin=False)
+    monkeypatch.setattr(config, "EPISODE_SETTLE_SECONDS", 0)
+    with MobileManipEnv() as env:
+        env.reset(seed=1)
+        env.robot.arm.move_pose("reach")  # All balls are far away from the initial robot.
+        start = env.hal.now()
+        target = env.data.ctrl[env.hal.i_act_arm].copy()
+        run_episode(env, brain, SCHEMAS, TASK, tmp_path / "collector", save_images=False, verbose=False)
+        assert env.hal.now() - start == pytest.approx(2.4)
+        assert env.hal.attached_object() is None and not env.hal._grasp_attempt_active
+        np.testing.assert_array_equal(env.data.ctrl[env.hal.i_act_arm], target)
+    record = lines(brain.storage.episode_dir / "actions.jsonl")[0]
+    assert [r["status"] for r in record["action_results"]] == ["failed", "failed"] + ["not_executed"] * (requested_closes - 1)
+    assert len(lines(tmp_path / "collector/trajectory.jsonl")) == 24
+    assert len(brain.model.requests) == 2
+
+
+@pytest.mark.parametrize("failure_code,second_action", [
+    ("ACTION_FAILED", "close_gripper"), ("GRASP_NOT_CONFIRMED", "observe")])
+def test_close_pair_exception_does_not_allow_other_failure_continuations(brain_factory, failure_code, second_action):
+    brain = brain_factory([play(actions=[{"action": "close_gripper", "args": {}},
+                                         {"action": second_action, "args": {}}])])
+    decide(brain)
+    value = receipt(brain, ["failed", "completed"])
+    value["execution_status"] = "partial"
+    value["action_results"][0]["action_applied"] = True
+    value["action_results"][0]["error"]["code"] = failure_code
+    with pytest.raises(RuntimeError, match="失败或取消"):
+        brain.accept_batch_result(value, observation(2))
+
+
 def test_arm_timeout_is_known_failure_but_tick_exception_stays_fatal():
     from control.drivers import ActionFailed, ArmDriver
     robot = SimpleNamespace(arm_q=np.zeros(2),

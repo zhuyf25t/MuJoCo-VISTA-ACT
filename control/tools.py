@@ -14,7 +14,6 @@ import numpy as np
 import config
 from hal import RobotInterface
 from .drivers import ActionFailed, ArmDriver, BaseDriver
-from . import perception
 
 
 class Tool:
@@ -81,18 +80,7 @@ class ToolLayer:
             return self.arm.open_gripper(on_tick=self.on_tick)
 
         def close_gripper() -> tuple[bool, str]:
-            ok, msg = self.arm.close_gripper(on_tick=self.on_tick)
-            if "✗" in msg:
-                # 失败瞬间臂仍在 reach 位(指尖贴地): 立即拍一帧做近距分析,
-                # 把"球相对夹爪的前后/左右偏差"直接写进结果 —— 模型的抓取批次
-                # 通常以 carry 结尾, reach 位的观测轮到它看时已不存在
-                try:
-                    hint = perception.gripper_hint(perception.sense(self.robot))
-                except Exception:
-                    hint = ""
-                if hint:
-                    msg += f" | 夹爪视角: {hint}"
-            return ok, msg
+            return self.arm.close_gripper(on_tick=self.on_tick)
 
         def done(success: bool) -> tuple[bool, str]:            # noqa: ARG001
             return True, "任务结束"
@@ -124,7 +112,11 @@ class ToolLayer:
                               mn=-config.ARM_NUDGE_MAX, mx=config.ARM_NUDGE_MAX)},
                  ["delta"], elbow))
         add(Tool("open_gripper", "张开手指(释放球)", {}, [], open_gripper))
-        add(Tool("close_gripper", "闭合手指(抓球; 球在夹爪内则持有)", {}, [], close_gripper))
+        add(Tool("close_gripper",
+                 f"停止底盘并固定闭爪{config.GRIPPER_CLOSE_SECONDS:.1f}秒，保持臂目标；"
+                 "抓取时同一play连续提交两次。第一次未确认仍执行紧邻的第二次；第二次未确认则停止同批后续动作。"
+                 "以第二次结果判断夹持，抬臂后仍须看图验球",
+                 {}, [], close_gripper))
         add(Tool("done", "宣告任务结束",
                  {"success": _p("自评是否完成", ptype="boolean")}, ["success"], done))
 

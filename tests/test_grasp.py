@@ -1,4 +1,4 @@
-"""Grasp admission and lifecycle: real contacts, measured aperture, 0.8 s actions."""
+"""Grasp admission and lifecycle: real contacts and fixed 1.2 s close actions."""
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 import config
+from control.drivers import GraspNotConfirmed
 from sim.backend import MjRobot
 from sim.env import MobileManipEnv
 
@@ -31,14 +32,15 @@ def assert_no_pending_grasp(hal):
     assert not hal._grasp_samples
 
 
-def test_seed1_one_close_is_exactly_point8_and_cannot_latch_later():
+def test_unconfirmed_close_finishes_at_1point2_and_cannot_latch_later():
     with MobileManipEnv() as env:
         restore_before_close(env, 1)
         start = env.hal.now()
-        env.robot.arm.close_gripper()
-        assert env.hal.now() - start == pytest.approx(0.8)
+        with pytest.raises(GraspNotConfirmed, match="未确认稳定夹持"):
+            env.robot.arm.close_gripper()
+        assert env.hal.now() - start == pytest.approx(1.2)
         assert env.hal.attached_object() is None
-        assert 0.55 < env.hal.finger_opening < 0.7  # Still pushing from one side.
+        assert 0.4 < env.hal.finger_opening < 0.45  # Aperture alone is not confirmation.
         assert_no_pending_grasp(env.hal)
 
         env.hal.step_ticks(20)  # The servo target persists, but admission is closed.
@@ -48,7 +50,7 @@ def test_seed1_one_close_is_exactly_point8_and_cannot_latch_later():
 
         start = env.hal.now()
         env.robot.arm.close_gripper()  # Only an explicit new action can acquire it.
-        assert env.hal.now() - start == pytest.approx(0.8)
+        assert env.hal.now() - start == pytest.approx(1.2)
         assert env.hal.attached_object() == "ball_1"
 
 
@@ -66,7 +68,7 @@ def test_seed2_stable_bilateral_grasp_preserves_measured_aperture(monkeypatch):
         monkeypatch.setattr(env.hal, "attach_object", record_attachment)
         start = env.hal.now()
         env.robot.arm.close_gripper()
-        assert env.hal.now() - start == pytest.approx(0.8)
+        assert env.hal.now() - start == pytest.approx(1.2)  # No early return on success.
         assert len(events) == 1
         when, name, opening, valid = events[0]
         assert config.GRASP_STABLE_SECONDS <= when - start <= 0.8
@@ -87,7 +89,7 @@ def test_seed2_stable_bilateral_grasp_preserves_measured_aperture(monkeypatch):
 
         retained = []
         env.robot.arm.close_gripper(on_tick=lambda: retained.append(env.hal.attached_object()))
-        assert retained == [name] * 8  # Repeated close never drops/reacquires the ball.
+        assert retained == [name] * 12  # Repeated close never drops/reacquires the ball.
         assert len(events) == 1
 
 
@@ -117,12 +119,17 @@ def test_open_and_reset_clear_all_grasp_state(phase):
 
 
 @pytest.mark.parametrize("callback", ["before_tick", "on_tick"])
-def test_interrupted_close_cannot_leave_an_acquisition_running(callback):
+@pytest.mark.parametrize("completed_ticks", [0, 8])
+def test_interrupted_close_cannot_leave_an_acquisition_running(callback, completed_ticks):
     with MobileManipEnv() as env:
-        restore_before_close(env, 2)
+        restore_before_close(env, 1)
+        calls = 0
 
         def interrupt():
-            raise RuntimeError("interrupted")
+            nonlocal calls
+            calls += 1
+            if calls > completed_ticks:
+                raise RuntimeError("interrupted")
 
         kwargs = {}
         if callback == "before_tick":
@@ -135,6 +142,21 @@ def test_interrupted_close_cannot_leave_an_acquisition_running(callback):
         assert_no_pending_grasp(env.hal)
         env.hal.step_ticks(20)
         assert env.hal.attached_object() is None
+
+
+def test_grasp_lost_before_close_returns_is_a_failure(monkeypatch):
+    with MobileManipEnv() as env:
+        restore_before_close(env, 2)
+        start = env.hal.now()
+        valid = env.hal._valid_grasp_balls
+        held = []
+        monkeypatch.setattr(env.hal, "_valid_grasp_balls",
+                            lambda: valid() if env.hal.now() - start < 0.8 else set())
+        with pytest.raises(GraspNotConfirmed):
+            env.robot.arm.close_gripper(on_tick=lambda: held.append(env.hal.attached_object()))
+        assert env.hal.now() - start == pytest.approx(1.2)
+        assert "ball_2" in held and held[-1] is None
+        assert_no_pending_grasp(env.hal)
 
 
 @pytest.mark.parametrize("brief", [True, False])

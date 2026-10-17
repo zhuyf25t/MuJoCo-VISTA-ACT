@@ -18,7 +18,7 @@ os.environ.setdefault("MUJOCO_GL", "glfw" if sys.platform == "win32" or "--gui" 
 
 import config  # noqa: E402
 from brains.vista.base import Decision  # noqa: E402
-from control.drivers import ActionFailed  # noqa: E402
+from control.drivers import ActionFailed, GraspNotConfirmed  # noqa: E402
 from control.tools import ToolLayer  # noqa: E402
 from recorder import DatasetStore, EpisodeRecorder, next_episode_dir  # noqa: E402
 from sim.env import MobileManipEnv, parse_task  # noqa: E402
@@ -33,7 +33,7 @@ def build_brain(memory_dir=None):
 def _run_vista_rounds(env, brain, tools, recorder, task_text, tool_schemas,
                       history, outcome, gui, verbose):
     """Execute each accepted play exactly once and settle it before any next model call."""
-    from brains.vista.state import action_result, batch_status
+    from brains.vista.state import action_result, batch_status, can_continue_close_pair
 
     obs = env.get_obs()
     for index in range(getattr(brain, "max_decisions", config.MAX_DECISIONS)):
@@ -68,6 +68,7 @@ def _run_vista_rounds(env, brain, tools, recorder, task_text, tool_schemas,
         cancelled = False
         for action_index, decision in enumerate(decisions):
             known_failure = False
+            grasp_not_confirmed = False
             if gui is not None and not gui.is_running():
                 cancelled = True
                 break
@@ -79,6 +80,7 @@ def _run_vista_rounds(env, brain, tools, recorder, task_text, tool_schemas,
                     raise RuntimeError("控制器返回了无效结果")
             except ActionFailed as error:
                 ok, raw_result, known_failure = False, str(error), True
+                grasp_not_confirmed = isinstance(error, GraspNotConfirmed)
             except BaseException as error:
                 ok, raw_result = False, f"控制执行中断: {type(error).__name__}"
                 fatal = error
@@ -87,6 +89,8 @@ def _run_vista_rounds(env, brain, tools, recorder, task_text, tool_schemas,
                                                    "completed" if ok else "failed" if known_failure else "unknown")
             if known_failure:
                 results[action_index]["action_applied"] = True
+            if grasp_not_confirmed:
+                results[action_index]["error"]["code"] = "GRASP_NOT_CONFIRMED"
             if not ok and not known_failure and fatal is None:
                 fatal = RuntimeError(f"VISTA 批次 {batch_id} 第 {action_index + 1} 个动作执行进度未知；"
                                      "剩余动作未执行，程序终止。")
@@ -110,7 +114,7 @@ def _run_vista_rounds(env, brain, tools, recorder, task_text, tool_schemas,
             if fatal is not None:
                 cancelled = ok  # A recorder failure can cancel the remainder after a known completion.
                 break
-            if known_failure:
+            if known_failure and not can_continue_close_pair(actions, results[action_index], action_index):
                 break  # Skip the rest of this batch, then let VISTA inspect and recover.
 
         receipt = {"batch_id": batch_id, "tool_call_id": call["id"],

@@ -8,6 +8,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import config
+from control.drivers import GraspNotConfirmed
 from sim.env import MobileManipEnv
 
 
@@ -73,8 +74,7 @@ def drive_to_x(env, target):
 
 
 @pytest.mark.parametrize("seed", [1, 2])
-@pytest.mark.parametrize("dx,dy", [(0, 0), (-0.02, -0.01), (-0.02, 0.01),
-                                   (0.02, -0.01), (0.02, 0.01)])
+@pytest.mark.parametrize("dx,dy", [(0, 0), (0.02, -0.01), (0.02, 0.01)])
 def test_ground_pickup_visible_carry_and_bin_release(seed, dx, dy, monkeypatch):
     with MobileManipEnv() as env:
         env.reset(seed=seed)
@@ -102,17 +102,9 @@ def test_ground_pickup_visible_carry_and_bin_release(seed, dx, dy, monkeypatch):
 
         monkeypatch.setattr(env.hal, "_auto_grasp", check_contacts)
         env.robot.arm.move_pose("reach")
-        # Acquisition now requires stable bilateral contact. Keep each call at
-        # 0.8 s and record the single-call limitation explicitly; the remaining
-        # assertions test transport/release after a physically confirmed grasp.
-        for attempt in range(4):
-            start = env.hal.now()
-            env.robot.arm.close_gripper()
-            assert env.hal.now() - start == pytest.approx(0.8)
-            if attempt == 0:
-                assert (env.hal.attached_object() is not None) == (dx == 0.02 and dy == -0.01)
-            if env.hal.attached_object() is not None:
-                break
+        start = env.hal.now()
+        env.robot.arm.close_gripper()
+        assert env.hal.now() - start == pytest.approx(1.2)
         assert env.hal.attached_object() == "ball_0"
         assert config.GRASP_OPENING_MIN < env.hal.finger_opening < config.GRASP_OPENING_MAX
         env.robot.arm.move_pose("carry")
@@ -140,11 +132,31 @@ def test_ground_pickup_visible_carry_and_bin_release(seed, dx, dy, monkeypatch):
 
 
 @pytest.mark.parametrize("seed", [1, 2])
+@pytest.mark.parametrize("dy", [-0.01, 0.01])
+def test_edge_pickup_reports_unconfirmed_after_fixed_duration(seed, dy):
+    with MobileManipEnv() as env:
+        env.reset(seed=seed)
+        place_pickup_fixture(env, -0.02, dy)
+        env.robot.arm.move_pose("reach")
+        start = env.hal.now()
+        with pytest.raises(GraspNotConfirmed):
+            env.robot.arm.close_gripper()
+        assert env.hal.now() - start == pytest.approx(1.2)
+        assert env.hal.attached_object() is None
+        assert not env.hal._grasp_attempt_active
+        env.hal.step_ticks(20)
+        assert env.hal.attached_object() is None
+
+
+@pytest.mark.parametrize("seed", [1, 2])
 def test_reach_empty_claw_closes_without_floor_stall(seed):
     with MobileManipEnv() as env:
         env.reset(seed=seed)
         env.robot.arm.move_pose("reach")
-        env.robot.arm.close_gripper()
+        start = env.hal.now()
+        with pytest.raises(GraspNotConfirmed):
+            env.robot.arm.close_gripper()
+        assert env.hal.now() - start == pytest.approx(1.2)
         assert env.hal.finger_opening < 0.05
         env.robot.arm.open_gripper()
         assert env.hal.finger_opening > 0.95

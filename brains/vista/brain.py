@@ -13,7 +13,8 @@ from .base import Brain, Decision
 from .graph import build_graph
 from .model import ChatModel, image_message
 from .settings import VistaSettings
-from .state import (VistaState, batch_status, check_current_round_results, validate_reply)
+from .state import (VistaState, batch_status, can_continue_close_pair,
+                    check_current_round_results, validate_reply)
 from .storage import VistaStorage
 from .tools import VistaTools
 
@@ -158,8 +159,8 @@ class VistaBrain(Brain):
                     or status == "failed" and type(applied) is not bool):
                 raise RuntimeError("VISTA 子动作施加情况与回执状态矛盾")
             if stopped and status != "not_executed":
-                raise RuntimeError("VISTA 第一项失败或取消后不能继续执行批内动作")
-            stopped = status != "completed"
+                raise RuntimeError("VISTA 不可恢复的失败或取消后不能继续执行批内动作")
+            stopped = status != "completed" and not can_continue_close_pair(actions, result, index - 1)
         expected = batch_status(results, cancelled=receipt["execution_status"] == "cancelled")
         if receipt["execution_status"] != expected:
             raise RuntimeError("VISTA 批次状态与各子动作结果矛盾")
@@ -181,13 +182,23 @@ class VistaBrain(Brain):
             fatal = error
         # Whitelist public facts. Raw controller text can contain simulator truth.
         results = []
-        for item in receipt["action_results"]:
+        for index, item in enumerate(receipt["action_results"]):
             public = {key: deepcopy(item[key]) for key in ("index", "action", "args", "status", "action_applied")}
             public["error"] = None
             if item["status"] in ("failed", "unknown"):
                 public["error"] = {"code": "ACTION_PROGRESS_UNKNOWN" if item["status"] == "unknown" else "ACTION_FAILED",
                                    "message": "控制调用未正常完成，物理效果需由图像和实测状态判断",
                                    "can_retry": item["status"] == "failed"}
+                if (item["action"] == "close_gripper" and item["status"] == "failed"
+                        and item["action_applied"] is True
+                        and isinstance(item["error"], dict)
+                        and item["error"].get("code") == "GRASP_NOT_CONFIRMED"):
+                    public["error"] = {"code": "GRASP_NOT_CONFIRMED",
+                                       "message": "闭爪已执行完毕，未确认稳定夹持；同批后续动作未执行。检查当前图像并重新定位后再抓取。",
+                                       "can_retry": True}
+                    if (can_continue_close_pair(call["args"]["actions"], item, index)
+                            and receipt["action_results"][index + 1]["status"] != "not_executed"):
+                        public["error"]["message"] = "本次闭爪未确认稳定夹持；已继续执行紧邻的第二次闭爪，请以第二次回执判断夹持结果。"
             results.append(public)
         status = receipt["execution_status"]
         error = None if status == "completed" else {

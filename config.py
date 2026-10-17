@@ -41,6 +41,7 @@ BODY_ARM_BASE = f"{ARM_PREFIX}arm_base"
 FINGER_OPEN_CTRL = 0.0
 FINGER_CLOSE_CTRL = 0.05    # 满行程闭合: 左指面到+0.027, 与固定右指(-0.077)夹住0.12m球; 行程不足时正对球差2mm永远无接触
 FINGER_CLOSED_THRESHOLD = 0.008   # 仅识别闭爪命令意图，不代表手指实际闭合
+GRIPPER_CLOSE_SECONDS = 1.2       # 单次闭爪固定总时长（12 个控制拍），持续判定稳定夹持
 GRASP_DIST = 0.15                 # 球心距 TCP 此距离内才做接触检测(预筛)
 GRASP_CONTACT_TOL_M = 0.003        # 指垫内表面接触位置容差
 GRASP_NORMAL_COS_MIN = 0.7        # 接触法向须主要沿指垫内表面法向

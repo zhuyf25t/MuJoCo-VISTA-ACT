@@ -89,6 +89,19 @@ def action_result(index: int, action: dict, status: str) -> ActionResult:
             "status": status, "action_applied": applied, "error": error}
 
 
+def can_continue_close_pair(actions: list[dict], result: ActionResult, index: int) -> bool:
+    """Only the first close may recover through its requested adjacent second close.
+
+    index is zero-based. Never invent an action or continue past the second
+    unconfirmed close; other failures retain the normal stop-on-failure rule.
+    """
+    return (result["action"] == "close_gripper" and result["status"] == "failed"
+            and result["action_applied"] is True and isinstance(result["error"], dict)
+            and result["error"].get("code") == "GRASP_NOT_CONFIRMED"
+            and index + 1 < len(actions) and actions[index + 1]["action"] == "close_gripper"
+            and (index == 0 or actions[index - 1]["action"] != "close_gripper"))
+
+
 def batch_status(results: list[ActionResult], *, cancelled: bool = False) -> str:
     statuses = [entry["status"] for entry in results]
     if "unknown" in statuses:
