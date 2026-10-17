@@ -174,6 +174,10 @@ checkpoint 只加载自己或可信来源产生的文件，使用 PyTorch `weigh
 python -m act.rollout --checkpoint output/act/exp_001/best.pt --seeds 1000 1001 --output output/act/eval_001 --gui
 ```
 
+加上 `--video` 会在评估目录保存各 seed 的俯视 MP4，包含最后 3 秒的静置判定，
+按控制频率 10 FPS 播放。云端无窗口评估可设置 `MUJOCO_GL=egl`，使用 `--device cuda --video`；
+俯视相机只用于回放，不输入策略网络。
+
 seed 只是命令示例，正式验证/测试名单仍由用户决定。默认 CPU 推理，每拍只执行一个
 0.1 秒区间，可选 `--device cuda`。MuJoCo 可以等待模型，因此仿真 10 Hz 不代表实际推理达到 10 Hz。
 报告包含最终环境成功率、仿真时间、控制拍数、推理延迟、请求与实际施加动作；

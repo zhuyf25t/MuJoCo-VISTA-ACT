@@ -63,10 +63,10 @@ class SimActionAdapter:
 
 
 def evaluate(checkpoint, seeds, output, *, device="cpu", max_steps=600, gui=False,
-             ensemble_coefficient=None, label="validation"):
+             ensemble_coefficient=None, label="validation", video=False):
     import config
     from sim.env import MobileManipEnv
-    from viz import GuiViewer
+    from viz import CameraRig, GuiViewer
     if not seeds or len(set(seeds)) != len(seeds) or any(type(s) is not int or s < 0 for s in seeds):
         raise ValueError("Supply distinct nonnegative evaluation seeds")
     if max_steps < 1 or label not in ("validation", "test"):
@@ -82,10 +82,18 @@ def evaluate(checkpoint, seeds, output, *, device="cpu", max_steps=600, gui=Fals
     with MobileManipEnv() as env:
         with ExitStack() as resources:
             viewer = resources.enter_context(GuiViewer(env.model, env.data)) if gui else None
+            camera = resources.enter_context(CameraRig(env.model, [config.CAM_OVERHEAD])) if video else None
             for seed in seeds:
                 env.reset(seed=seed)
                 policy.reset()
                 adapter = SimActionAdapter(env.hal, config.CTRL_DT, config.GRIPPER_CLOSE_SECONDS)
+                writer = None
+                if video:
+                    import imageio.v2 as imageio
+                    writer = resources.enter_context(imageio.get_writer(
+                        str(output / f"seed-{seed}.mp4"), fps=config.CTRL_HZ,
+                        codec="libx264", quality=8, macro_block_size=None))
+                    writer.append_data(camera.render(env.data)[config.CAM_OVERHEAD])
                 latencies, trajectory, stopped = [], [], "horizon"
                 start = env.hal.now()
                 try:
@@ -105,6 +113,8 @@ def evaluate(checkpoint, seeds, output, *, device="cpu", max_steps=600, gui=Fals
                                            "requested": requested.tolist(), "applied": applied.tolist()})
                         env.hal.tick()
                         adapter.after_tick()
+                        if writer:
+                            writer.append_data(camera.render(env.data)[config.CAM_OVERHEAD])
                         if viewer:
                             viewer.set_status(f"ACT {label} | seed {seed} | step {step + 1}")
                             viewer.sync()
@@ -119,13 +129,18 @@ def evaluate(checkpoint, seeds, output, *, device="cpu", max_steps=600, gui=Fals
                             stopped = "window_closed"
                             break
                         env.hal.tick()
+                        if writer:
+                            writer.append_data(camera.render(env.data)[config.CAM_OVERHEAD])
                         if viewer:
                             viewer.sync()
+                if writer:
+                    writer.close()
                 result = {"seed": seed, "success": stopped != "window_closed" and bool(env.success()),
                           "stop_reason": stopped, "control_steps": len(trajectory),
                           "sim_seconds": env.hal.now() - start,
                           "mean_policy_latency_ms": float(np.mean(latencies) * 1000) if latencies else None,
-                          "p95_policy_latency_ms": float(np.quantile(latencies, .95) * 1000) if latencies else None}
+                          "p95_policy_latency_ms": float(np.quantile(latencies, .95) * 1000) if latencies else None,
+                          "video": f"seed-{seed}.mp4" if video else None}
                 atomic_json(output / f"seed-{seed}.json", {**result, "trajectory": trajectory})
                 results.append(result)
                 atomic_json(output / "summary.json", {
@@ -148,11 +163,12 @@ def main():
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--max-steps", type=int, default=600)
     parser.add_argument("--gui", action="store_true")
+    parser.add_argument("--video", action="store_true", help="Record each rollout as an overhead MP4 at control FPS")
     parser.add_argument("--ensemble-coefficient", type=float)
     parser.add_argument("--label", choices=("validation", "test"), default="validation")
     args = parser.parse_args()
     evaluate(args.checkpoint, args.seeds, args.output, device=args.device, max_steps=args.max_steps,
-             gui=args.gui, ensemble_coefficient=args.ensemble_coefficient, label=args.label)
+             gui=args.gui, ensemble_coefficient=args.ensemble_coefficient, label=args.label, video=args.video)
 
 
 if __name__ == "__main__":

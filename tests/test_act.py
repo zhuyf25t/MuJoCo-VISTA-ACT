@@ -170,12 +170,17 @@ def test_train_resume_and_standalone_policy(dataset_root, tmp_path, monkeypatch)
     action = policy.act(np.zeros((1, 240, 320, 3), np.uint8), np.zeros(5, np.float32))
     assert action.shape == (5,) and np.isfinite(action).all()
     from act.rollout import evaluate
-    results = evaluate(checkpoint_path, [987654], tmp_path / "rollout", max_steps=2)
+    results = evaluate(checkpoint_path, [987654], tmp_path / "rollout", max_steps=2, video=True)
     assert results[0]["control_steps"] == 2
     assert results[0]["sim_seconds"] == pytest.approx(3.2)
     trace = json.loads((tmp_path / "rollout" / "seed-987654.json").read_text())
     assert len(trace["trajectory"]) == 2
     assert np.isfinite(trace["trajectory"][0]["applied"]).all()
+    import imageio.v2 as imageio
+    with imageio.get_reader(tmp_path / "rollout" / results[0]["video"]) as reader:
+        assert reader.get_meta_data()["fps"] == 10
+        assert reader.count_frames() == 33  # Initial state, two control ticks, 30 settle ticks.
+        assert reader.get_data(0).shape == (480, 640, 3)
 
 
 def test_early_stopping_preserves_best_checkpoint(dataset_root, tmp_path, monkeypatch):
