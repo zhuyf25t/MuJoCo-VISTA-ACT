@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+from math import ceil
 from typing import Any, Callable
 
 import numpy as np
@@ -88,11 +89,12 @@ class ToolLayer:
         def observe() -> tuple[bool, str]:
             # No pose/holding feedback: simply stop drive and allow a new frame.
             self.robot.command_drive(0.0, 0.0)
-            self.robot.step_ticks(2, self.on_tick)
-            return True, "已发送底盘停止指令并等待两个控制拍，可重新观察"
+            ticks = ceil(config.OBSERVE_SECONDS / config.CTRL_DT)
+            self.robot.step_ticks(ticks, self.on_tick)
+            return True, f"已发送底盘停止指令并推进仿真 {ticks * config.CTRL_DT:.1f} 秒，可比较前后帧的变化"
 
         add = self._add
-        add(Tool("observe", "停止底盘并短暂等待，下一轮取得新图；保持机械臂和夹爪目标", {}, [], observe))
+        add(Tool("observe", f"停止底盘并固定等待 {config.OBSERVE_SECONDS:.1f} 秒仿真时间，取得新图用于比较变化；保持机械臂和夹爪目标", {}, [], observe))
         add(Tool("forward", "底盘前进", {"seconds": _s("前进时长")}, [], forward))
         add(Tool("back", "底盘后退", {"seconds": _s("后退时长")}, [], back))
         add(Tool("turn_left", "底盘原地左转(逆时针)", {"seconds": _s("左转时长")}, [], turn_left))

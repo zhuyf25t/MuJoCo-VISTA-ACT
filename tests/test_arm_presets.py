@@ -13,8 +13,8 @@ from sim.env import MobileManipEnv
 
 
 FINGERS = ("arm_left_finger_geom", "arm_right_finger_geom")
-# Stable bilateral acquisition changes the actual grip position. Edge fixtures
-# measure 39.55+ mm during transport: nominal 4 cm with 1 mm pose tolerance.
+# Require nominal 4 cm ball-bottom clearance with 1 mm pose tolerance,
+# including both transport poses and the transition between them.
 MIN_RIM_CLEARANCE = 0.039
 
 
@@ -74,11 +74,16 @@ def drive_to_x(env, target):
 
 
 @pytest.mark.parametrize("seed", [1, 2])
-@pytest.mark.parametrize("dx,dy", [(0, 0), (0.02, -0.01), (0.02, 0.01)])
+@pytest.mark.parametrize("dx,dy", [(0, 0), (-0.02, -0.01), (-0.02, 0.01),
+                                    (0.02, -0.01), (0.02, 0.01)])
 def test_ground_pickup_visible_carry_and_bin_release(seed, dx, dy, monkeypatch):
     with MobileManipEnv() as env:
         env.reset(seed=seed)
         place_pickup_fixture(env, dx, dy)
+        if dx == 0 and dy == 0:
+            lo, hi = sphere_image_bounds(env)
+            np.testing.assert_allclose((lo + hi) / 2, [160, 110], atol=0.6)
+            np.testing.assert_allclose(hi - lo, [44, 44], atol=0.6)
         fingers = {env.model.geom(n).id for n in FINGERS}
         floor = env.model.geom("floor").id
         walls = {env.model.geom(f"bin_wall_{n}").id for n in ("xp", "xn", "yp", "yn")}
@@ -103,9 +108,17 @@ def test_ground_pickup_visible_carry_and_bin_release(seed, dx, dy, monkeypatch):
         monkeypatch.setattr(env.hal, "_auto_grasp", check_contacts)
         env.robot.arm.move_pose("reach")
         start = env.hal.now()
+        # Match the explicit two-close policy; only the first may be unconfirmed.
+        try:
+            env.robot.arm.close_gripper()
+        except GraspNotConfirmed:
+            pass
         env.robot.arm.close_gripper()
-        assert env.hal.now() - start == pytest.approx(1.2)
+        assert env.hal.now() - start == pytest.approx(2.4)
         assert env.hal.attached_object() == "ball_0"
+        if dx == 0 and dy == 0:
+            assert env.hal.tcp_pos[0] - env.hal.base_pose[0] == pytest.approx(0.545, abs=0.002)
+            assert env.hal.tcp_pos[2] == pytest.approx(0.094, abs=0.002)
         assert config.GRASP_OPENING_MIN < env.hal.finger_opening < config.GRASP_OPENING_MAX
         env.robot.arm.move_pose("carry")
         assert env.hal.attached_object() == "ball_0"

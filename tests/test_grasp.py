@@ -9,6 +9,7 @@ import pytest
 
 import config
 from control.drivers import GraspNotConfirmed
+from control.tools import ToolLayer
 from sim.backend import MjRobot
 from sim.env import MobileManipEnv
 
@@ -30,6 +31,29 @@ def assert_no_pending_grasp(hal):
     assert not hal._grasp_attempt_active
     assert hal._grasp_candidate is None
     assert not hal._grasp_samples
+
+
+def test_observe_advances_eight_recorded_ticks_without_reopening_grasp():
+    with MobileManipEnv() as env:
+        restore_before_close(env, 1)
+        with pytest.raises(GraspNotConfirmed):
+            env.robot.arm.close_gripper()
+        arm_target = env.data.ctrl[env.hal.i_act_arm].copy()
+        finger_target = env.data.ctrl[env.hal.i_act_fi]
+        env.hal.command_drive(0.2, 0.1)
+        recorded = []
+        layer = ToolLayer(env.robot.base, env.robot.arm, env.hal,
+                          on_tick=lambda: recorded.append(env.hal.now()))
+        start = env.hal.now()
+        ok, _ = layer.execute("observe", {})
+        assert ok
+        assert env.hal.now() - start == pytest.approx(0.8)
+        assert np.array(recorded) - start == pytest.approx(np.arange(1, 9) * 0.1)
+        np.testing.assert_array_equal(env.data.ctrl[env.hal.i_act_arm], arm_target)
+        assert env.data.ctrl[env.hal.i_act_fi] == finger_target
+        np.testing.assert_allclose(env.hal.applied_action[-2:], [0, 0])
+        assert env.hal.attached_object() is None
+        assert_no_pending_grasp(env.hal)
 
 
 def test_unconfirmed_close_finishes_at_1point2_and_cannot_latch_later():
