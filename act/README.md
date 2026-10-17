@@ -178,6 +178,18 @@ python -m act.rollout --checkpoint output/act/exp_001/best.pt --seeds 1000 1001 
 按控制频率 10 FPS 播放。云端无窗口评估可设置 `MUJOCO_GL=egl`，使用 `--device cuda --video`；
 俯视相机只用于回放，不输入策略网络。
 
+AutoDL 的精简 Ubuntu 镜像可能缺少离屏渲染依赖。若出现 EGL 加载错误，可先安装
+`libegl1 libegl-mesa0 libgl1-mesa-dri`。若随后提示 Conda 的 `libstdc++.so.6`
+缺少 `GLIBCXX_3.4.30`，本项目在该镜像上验证过以下进程级设置：
+
+```bash
+export MUJOCO_GL=egl
+export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6
+```
+
+这两个环境变量用于云端 Linux；本地 Windows 不需要。GPU 训练和仿真渲染是两项
+独立能力，应先确认 `torch.cuda.is_available()`，再单独测试实际 MuJoCo 录像。
+
 seed 只是命令示例，正式验证/测试名单仍由用户决定。默认 CPU 推理，每拍只执行一个
 0.1 秒区间，可选 `--device cuda`。MuJoCo 可以等待模型，因此仿真 10 Hz 不代表实际推理达到 10 Hz。
 报告包含最终环境成功率、仿真时间、控制拍数、推理延迟、请求与实际施加动作；
@@ -208,5 +220,8 @@ ACT 适配器采用“开到闭的命令变化开启一次 1.2 秒判定，保�
 训练集统计、Windows 来源路径迁移、文件哈希校验、CVAE 梯度、确定性 z=0 推理、
 epoch 恢复一致性、早停和 best/last 区分、独立 checkpoint 推理、同时间集成，以及
 两拍真实 MuJoCo 执行和收尾。另在 CPU 上用官方 ImageNet 权重验证了默认规模网络的
-单样本前向/反向。未对当前采集数据划分、训练；CUDA/AMP 的速度和显存尚未实测，
-任务成功率尚无 ACT 实验结果。
+单样本前向/反向。RTX 3080 Ti 上已验证默认完整模型的 8 次 FP32/AdamW 更新和
+z=0 推理：batch=8、K=32、单相机 240×320，PyTorch 峰值分配约 1.12 GiB、
+峰值保留约 1.34 GiB；这是合成输入短测，不能等同于所有配置的显存保证。
+同一云端环境的训练/恢复/独立策略/真实 MuJoCo 录像集成测试通过。AMP 尚未实测。
+正式实验指标与任务成功率以对应 `output/act/exp_*/` 的日志和评估摘要为准。
