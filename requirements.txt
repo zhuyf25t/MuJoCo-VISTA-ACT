@@ -1,6 +1,6 @@
 # Python 3.12+; validated baseline: Python 3.12.
 # Install: python -m pip install -r requirements.txt
-# Direct dependencies pinned to the versions used by the verified project tests.
+# Direct dependencies pinned for reproducible installation.
 # WSL GUI also needs WSL 2/WSLg and system OpenGL libraries.
 
 # Physics, model composition, numerical control and visual perception.
@@ -20,6 +20,12 @@ Pillow==12.3.0
 h5py==3.16.0
 imageio==2.37.4
 imageio-ffmpeg==0.6.0
+
+# ACT training/inference. Choose a matching CPU/CUDA wheel index for your machine.
+# These versions are an intentionally fixed compatible pair, not a latest-version claim.
+torch==2.10.0
+torchvision==0.25.0
+PyYAML==6.0.3
 
 # Existing control, simulation and mocked LLM tests.
 pytest==9.1.1

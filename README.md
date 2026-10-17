@@ -1,16 +1,17 @@
 # MuJoCo · VISTA
 
-让视觉模型通过车头相机控制移动机械臂，在 MuJoCo 中完成捡球、搬运和投放。采集器记录执行前图像与实测状态、随后施加的动作，完整成功集自动导出 ACT HDF5，并持续追加 manifest。当前只维护 VISTA 这一条示范路线；ACT 网络、训练和实机接入尚未实现。
+让视觉模型通过车头相机控制移动机械臂，在 MuJoCo 中完成捡球、搬运和投放。采集器记录执行前图像与实测状态、随后施加的动作，完整成功集自动导出 ACT HDF5，并持续追加 manifest。VISTA 负责示范；`act/` 提供数据准备、训练、checkpoint 推理和仿真评估，实机接入尚未实现。当前真实采集数据的训练/验证划分与正式训练尚未执行。
 
 ## 当前结构
 
 ```text
 brains/vista/       VISTA 决策、工具、图片与笔记管理
+act/                ACT 数据读取、网络、训练、推理与闭环评估（默认 K=32）
 control/           底盘、两自由度机械臂、夹爪控制
 sim/               MuJoCo 场景与机器人封装
 models/            当前使用的四个 XML 模型文件
 tests/             VISTA、控制与回放测试
-act.md             已实现的数据接口，以及待实现的 ACT 模型与训练设计
+act.md             ACT 原理与早期教学设计；实际运行方式见 act/README.md
 assets/act/        ACT 设计配图
 run_collect.py     采集入口，默认 VISTA、1 个 episode
 hal.py             仿真硬件接口
@@ -117,6 +118,8 @@ VISTA 用 `play` 交出一批动作；采集器按顺序执行后，将批次回
 当前已实现采集与回放闭环；真实模型的视觉判断、抓球稳定性和成功率仍需单独验证。
 
 ## 验证
+
+ACT 的样本/epoch 概念、数据准备、AutoDL 路径迁移、训练和恢复命令见 [act/README.md](act/README.md)。准备程序要求显式指定划分方案，读取采集快照并写入新的实验目录，不修改正在采集的 manifest。训练依赖已合并进 `requirements.txt`；按机器选择匹配的 PyTorch CPU/CUDA wheel。
 
 ```powershell
 .\.venv-gui\Scripts\python.exe -m pytest -q
