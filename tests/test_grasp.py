@@ -109,7 +109,9 @@ def test_seed2_stable_bilateral_grasp_preserves_measured_aperture(monkeypatch):
             env.robot.arm.move_pose(pose)
             assert env.hal.attached_object() == name
             assert 0.28 < env.hal.finger_opening < 0.35
-            assert env.data.body(name).xpos[2] - config.BALL_R > config.BIN_WALL_TOP + 0.04
+            # Short drop trades 5 mm of height for a larger visible ball area.
+            clearance = 0.03 if pose == "drop" else 0.04
+            assert env.data.body(name).xpos[2] - config.BALL_R > config.BIN_WALL_TOP + clearance
 
         retained = []
         env.robot.arm.close_gripper(on_tick=lambda: retained.append(env.hal.attached_object()))

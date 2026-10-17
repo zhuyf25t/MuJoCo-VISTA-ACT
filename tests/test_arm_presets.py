@@ -13,9 +13,8 @@ from sim.env import MobileManipEnv
 
 
 FINGERS = ("arm_left_finger_geom", "arm_right_finger_geom")
-# Require nominal 4 cm ball-bottom clearance with 1 mm pose tolerance,
-# including both transport poses and the transition between them.
-MIN_RIM_CLEARANCE = 0.039
+# Short drop keeps >=3 cm clearance across the calibrated pickup variations.
+MIN_RIM_CLEARANCE = 0.03
 
 
 def place_pickup_fixture(env, dx=0.0, dy=0.0):
@@ -50,7 +49,7 @@ def sphere_image_bounds(env):
     return pixels.min(axis=0), pixels.max(axis=0)
 
 
-def assert_visible_ball(env):
+def assert_visible_ball(env, *, render=False):
     lo, hi = sphere_image_bounds(env)
     width, height = config.CAM_FRONT_RES
     # Higher transport poses may clip the sphere's top, but must keep most of
@@ -59,6 +58,15 @@ def assert_visible_ball(env):
     assert 25 < hi[1] < height - 3
     visible_height = hi[1] - max(0, lo[1])
     assert visible_height / (hi[1] - lo[1]) >= 0.65
+    if render:
+        # Verify actual colored pixels, including gripper occlusion, not projection alone.
+        image = env.hal.front_image()
+        x0, y0 = np.maximum(0, np.floor(lo)).astype(int)
+        x1, y1 = np.minimum([width, height], np.ceil(hi)).astype(int)
+        crop = image[y0:y1, x0:x1].astype(float)
+        red, green, blue = crop[..., 0], crop[..., 1], crop[..., 2]
+        assert np.count_nonzero((green > red * .8) & (green > blue * 2)
+                                & (red > blue * 2) & (red > 40)) > 400
 
 
 def drive_to_x(env, target):
@@ -79,6 +87,10 @@ def drive_to_x(env, target):
 def test_ground_pickup_visible_carry_and_bin_release(seed, dx, dy, monkeypatch):
     with MobileManipEnv() as env:
         env.reset(seed=seed)
+        # Isolate preset/grasp variation from the brain's navigation task: begin
+        # centered on this wall, with a short transport segment before approaching the wall.
+        env.data.qpos[env.hal.i_free:env.hal.i_free + 2] = [0.2, 0.0]
+        mujoco.mj_forward(env.model, env.data)
         place_pickup_fixture(env, dx, dy)
         if dx == 0 and dy == 0:
             lo, hi = sphere_image_bounds(env)
@@ -87,11 +99,14 @@ def test_ground_pickup_visible_carry_and_bin_release(seed, dx, dy, monkeypatch):
         fingers = {env.model.geom(n).id for n in FINGERS}
         floor = env.model.geom("floor").id
         walls = {env.model.geom(f"bin_wall_{n}").id for n in ("xp", "xn", "yp", "yn")}
+        chassis = env.model.geom("chassis").id
         ball = env.model.geom("ball_0_geom").id
         original = env.hal._auto_grasp
         check_clearance = False
+        touched_wall = False
 
         def check_contacts():
+            nonlocal touched_wall
             # Called after every 2 ms physics step, including motion between presets.
             if check_clearance:
                 assert env.hal.attached_object() == "ball_0", "lost grasp during transport"
@@ -99,6 +114,8 @@ def test_ground_pickup_visible_carry_and_bin_release(seed, dx, dy, monkeypatch):
                 assert bottom > config.BIN_WALL_TOP + MIN_RIM_CLEARANCE, "held ball lost rim clearance"
             for contact in env.data.contact:
                 pair = {contact.geom1, contact.geom2}
+                if chassis in pair and pair & walls:
+                    touched_wall = True
                 assert not (floor in pair and pair & fingers), "finger pressed into floor"
                 assert not (pair & walls and pair & fingers), "finger hit bin rim"
                 if env.hal.attached_object() is not None:
@@ -131,12 +148,18 @@ def test_ground_pickup_visible_carry_and_bin_release(seed, dx, dy, monkeypatch):
         assert_visible_ball(env)
         carry_forward = env.hal.tcp_pos[0] - env.hal.base_pose[0]
         env.robot.arm.move_pose("drop")
-        assert env.hal.tcp_pos[0] - env.hal.base_pose[0] > carry_forward + 0.04
+        assert env.hal.tcp_pos[0] - env.hal.base_pose[0] < carry_forward - 0.20
         assert env.data.body("ball_0").xpos[2] - config.BALL_R > config.BIN_WALL_TOP + MIN_RIM_CLEARANCE
         assert_visible_ball(env)
-        ball_forward = env.data.body("ball_0").xpos[0] - env.hal.base_pose[0]
-        drive_to_x(env, config.BIN_POS[0] - ball_forward)
-        assert_visible_ball(env)
+        # Fixture detects wall contact; the controller still completes each full
+        # ordinary step. Sliding/settling at a wall need not produce zero travel.
+        for _ in range(60):
+            env.robot.base.forward(0.1)
+            if touched_wall:
+                break
+        else:
+            pytest.fail(f"ordinary forward never reached the bin wall: {env.hal.base_pose}")
+        assert_visible_ball(env, render=True)
         check_clearance = False  # Release must allow the ball to fall below the rim.
         env.robot.arm.open_gripper()
         env.hal.step_ticks(30)

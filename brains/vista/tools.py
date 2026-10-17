@@ -137,10 +137,14 @@ def tool_schemas(settings: VistaSettings, actions: dict) -> list[dict]:
     inspect_schema = _object({"question": _text("此次查图要直接看清的状态、关系或待解决疑点；原文保留在上下文中", settings.max_question_chars),
                               "views": {"type": "array", "minItems": 1, "maxItems": settings.max_views,
                                         "items": _object(view, ("label", "frame_id"))}}, ("question", "views"))
-    pixel_view = {**deepcopy(view), "rows": _integer("均匀采样行数；至少 1，不能超过区域高度"),
-                  "columns": _integer("均匀采样列数；至少 1，不能超过区域宽度")}
+    pixel_view = {**deepcopy(view),
+                  "rows": _integer("均匀采样行数，不是像素高度；不能超过 region.height；本区域点数为 rows×columns",
+                                   1, settings.max_samples),
+                  "columns": _integer("均匀采样列数，不是像素宽度；不能超过 region.width；本区域点数为 rows×columns",
+                                      1, settings.max_samples)}
     pixels_schema = _object({"question": _text("此次取像素的检查目的", settings.max_question_chars),
                              "views": {"type": "array", "minItems": 1, "maxItems": settings.max_views,
+                                       "description": "每个区域的 label、frame_id、region、rows、columns 都放在该 views 元素内，不放在顶层。",
                                        "items": _object(pixel_view, pixel_view.keys())}}, ("question", "views"))
     action_variants = []
     for name, definition in actions.items():
@@ -153,7 +157,9 @@ def tool_schemas(settings: VistaSettings, actions: dict) -> list[dict]:
         ("inspect", "按 frame_id 读取当前或历史归档原图/裁剪图；图旁 observation 和 timestamp_s 属于该原图采样时刻。"
          "通过图片索引查找，不依赖 history 中已有动作记录；不推进环境、不回答 question、不改变当前观测。" + coordinates,
          inspect_schema),
-        ("read_pixels", f"从原图区域的均匀网格中心读取 RGB 和坐标，不识别物体；所有区域合计最多 {settings.max_samples} 点。" + coordinates,
+        ("read_pixels", "从原图区域的均匀网格中心读取 RGB 和坐标，不识别物体；"
+         f"总点数为所有 views 的 rows×columns 之和，最多 {settings.max_samples} 点，这是上限而非建议用量。"
+         "先用 inspect 定位，只对待核实的小区域稀疏取色，不用密集取色代替看图；小块参考色通常用3×3点即可。" + coordinates,
          pixels_schema),
         ("history", "查询本 episode 已结束或中断并结算的 play 批次；尚未提交或正在执行的批次不在历史中，初始为空。"
          "每批结束时只追加一条记录，包含全部子动作 actions、expectation、execution_status、action_results 及前后帧编号。"
@@ -220,7 +226,8 @@ class VistaTools:
                 total += view["rows"] * view["columns"]
             prepared.append((view, info, region))
         if total > self.settings.max_samples:
-            raise _Arguments("SAMPLE_LIMIT", f"总采样点数不能超过 {self.settings.max_samples}")
+            raise _Arguments("SAMPLE_LIMIT", f"请求了 {total} 点，总采样点数不能超过 {self.settings.max_samples}",
+                             "总点数为所有 views 的 rows×columns 之和；减少采样行列数，先用 inspect 定位再稀疏取色")
         return prepared
 
     def invoke(self, name: str, args) -> tuple[dict | None, list]:
