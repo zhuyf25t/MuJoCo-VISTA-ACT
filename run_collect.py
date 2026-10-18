@@ -35,7 +35,6 @@ def _run_vista_rounds(env, brain, tools, recorder, task_text, tool_schemas,
     """Execute each accepted play exactly once and settle it before any next model call."""
     from brains.vista.state import action_result, batch_status, can_continue_close_pair
 
-    obs = env.get_obs()
     for index in range(getattr(brain, "max_decisions", config.MAX_DECISIONS)):
         if gui is not None and not gui.is_running():
             outcome.update(reason="用户关闭窗口", stop_code="window_closed")
@@ -43,7 +42,7 @@ def _run_vista_rounds(env, brain, tools, recorder, task_text, tool_schemas,
         outcome["decision_rounds"] = index + 1
         if gui is not None:
             gui.set_status(f"VISTA | round {index + 1}\nThinking...")
-        decisions = brain.decide(obs, task_text, tool_schemas, history)
+        decisions = brain.decide(env.get_obs().current, task_text, tool_schemas, history)
         call = brain.handoff()
         if call["name"] == "finish":
             expected = [Decision(call["args"]["reason"], "done", {"success": call["args"]["success"]})]
@@ -61,7 +60,7 @@ def _run_vista_rounds(env, brain, tools, recorder, task_text, tool_schemas,
         actions = call["args"]["actions"]
         if [{"action": decision.tool, "args": decision.args} for decision in decisions] != actions:
             raise RuntimeError("VISTA play 与返回的 Decision 批次不一致")
-        batch_id = brain.next_batch_id
+        batch_id = brain.active_batch_id
         brain.record_batch_start(batch_id)
         results = [action_result(i, action, "not_executed") for i, action in enumerate(actions, 1)]
         fatal = None
@@ -74,6 +73,7 @@ def _run_vista_rounds(env, brain, tools, recorder, task_text, tool_schemas,
                 break
             if gui is not None:
                 gui.set_status(f"VISTA | batch {batch_id} | action {action_index + 1}/{len(actions)}\n{decision.tool}")
+            start_frame = env.current_frame_no
             try:
                 ok, raw_result = tools.execute(decision.tool, decision.args)
                 if type(ok) is not bool or not isinstance(raw_result, str):
@@ -87,6 +87,7 @@ def _run_vista_rounds(env, brain, tools, recorder, task_text, tool_schemas,
             # A false boolean from this controller does not prove the robot never moved.
             results[action_index] = action_result(action_index + 1, actions[action_index],
                                                    "completed" if ok else "failed" if known_failure else "unknown")
+            results[action_index]["frame_range"] = [start_frame, env.current_frame_no]
             if known_failure:
                 results[action_index]["action_applied"] = True
             if grasp_not_confirmed:
@@ -129,6 +130,7 @@ def _run_vista_rounds(env, brain, tools, recorder, task_text, tool_schemas,
                 fatal.add_note("批次停止后也未能取得最终车头图")
         try:
             brain.accept_batch_result(receipt, obs_after)
+            env.ack_observations(obs_after.current.frame_no)
         except Exception as error:
             if fatal is None:
                 raise
@@ -136,7 +138,6 @@ def _run_vista_rounds(env, brain, tools, recorder, task_text, tool_schemas,
                 fatal.add_note(str(error))
         if fatal is not None:
             raise fatal
-        obs = obs_after
         # Even the last batch has already received its ToolMessage and final PNG.
         if cancelled:
             outcome.update(reason="用户关闭窗口", stop_code="window_closed")
@@ -204,21 +205,41 @@ def run_episode(env, brain, tool_schemas, task_text, ep_dir, gui=None,
 
         def on_tick():
             nonlocal last_gui_tick
-            recorder.on_tick(env.model, env.data, env.robot)
+            recording_error = None
+            try:
+                recorder.on_tick(env.model, env.data, env.robot)
+            except BaseException as error:
+                recording_error = error
+            try:
+                if env.observation_stream_active:
+                    env.capture_observation_tick()
+            except BaseException as error:
+                if recording_error is None:
+                    raise
+                recording_error.add_note(f"VISTA 同拍采样也失败：{type(error).__name__}: {error}")
+            if recording_error is not None:
+                raise recording_error
             if gui is not None:
                 if gui_realtime:
                     time.sleep(max(0.0, config.CTRL_DT - (time.monotonic() - last_gui_tick)))
                 gui.sync()
                 last_gui_tick = time.monotonic()
 
-        tools = ToolLayer(env.robot.base, env.robot.arm, env.robot.hal, on_tick=on_tick)
+        tools = ToolLayer(env.robot.base, env.robot.arm, env.robot.hal, on_tick=on_tick,
+                          read_observation=lambda: env.get_obs().current)
         history: list[dict] = []
         outcome = {"success": False, "brain_success": None, "decisions": 0,
                    "decision_rounds": 0, "reason": "决策轮数耗尽", "stop_code": "decision_limit"}
         try:
             brain.begin_episode(ep_dir, task_text, tool_schemas)
-            _run_vista_rounds(env, brain, tools, recorder, task_text, tool_schemas,
-                              history, outcome, gui, verbose)
+            env.start_observation_stream()
+            try:
+                _run_vista_rounds(env, brain, tools, recorder, task_text, tool_schemas,
+                                  history, outcome, gui, verbose)
+                brain.finalize_collection(env.get_obs(), outcome["stop_code"])
+                env.ack_observations(env.current_frame_no)
+            finally:
+                env.stop_observation_stream()
             if outcome["stop_code"] in ("brain_done", "decision_limit", "environment_success"):
                 _settle_episode(env, outcome, on_tick, gui, verbose)
             outcome["success"] = env.success()
@@ -233,7 +254,15 @@ def run_episode(env, brain, tool_schemas, task_text, ep_dir, gui=None,
             brain.end_episode(outcome)
         except BaseException as error:
             # Interrupted/unknown execution is never eligible for training.
-            brain.abort_episode(error, outcome)
+            window = None
+            try:
+                window = env.get_obs()
+            except BaseException as secondary:
+                # Even a second interrupt during cleanup must not skip failed
+                # episode finalization or replace the original interruption.
+                error.add_note(f"VISTA 中断时无法读取观测缓存：{type(secondary).__name__}")
+            env.stop_observation_stream()
+            brain.abort_episode(error, outcome, window)
             try:
                 recorder.finish(False, {"reason": f"采集中断: {type(error).__name__}", "error": str(error),
                                         "stop_code": "interrupted",

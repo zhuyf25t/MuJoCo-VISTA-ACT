@@ -18,7 +18,8 @@ brains/vista/
 ├── storage.py
 ├── settings.py
 ├── prompts/
-│   └── system.txt
+│   ├── system.txt
+│   └── system_old_1018.txt
 ├── README.md
 └── README_log.md
 ```
@@ -34,9 +35,12 @@ brains/vista/
 | `storage.py` | 原始 PNG、帧索引、笔记和运行日志的读写 |
 | `settings.py` | 调用预算、工具数量、图片尺寸及字符数限制 |
 | `prompts/system.txt` | 任务、相机、机器人动作与查证方法的系统提示词 |
+| `prompts/system_old_1018.txt` | 本次精简前的完整提示词归档；运行时不加载 |
 | `README_log.md` | 原设计文档与修订记录的完整归档 |
 
 外层 [run_collect.py](../../run_collect.py) 管理任务和数据记录，[control/tools.py](../../control/tools.py) 执行动作并推进仿真。迁移环境时，主要替换观察入口、动作定义与执行器、任务提示词；消息循环和图片/笔记管理可沿用。
+
+当前 `system.txt` 以 `system_old_1018.txt` 为底稿，保留本场景的完整抓取与投放操作要求：stow下球心/直径标定、reach后查图、连续两次闭爪、抬起验球、drop短前伸靠箱策略，以及释放前82点取色和落点检查。逐帧观测、history双模式与分页等接口说明按现有实现更新；一般性的批次合并建议不能省略必查步骤。运行时只在 `VistaBrain` 初始化时读取 `system.txt`，已启动的采集进程需重新启动才会加载修改。已有 `guide.md` 仍会进入上下文，但不能覆盖这些操作要求。
 
 ## 配置与运行
 
@@ -112,13 +116,13 @@ class VistaState(TypedDict):
 | `base_v_mps` | 车体前向速度，m/s |
 | `base_w_radps` | 车体转向角速度，rad/s，正值为左转 |
 
-`timestamp_s` 为仿真采样时间。实测状态与动作目标分别记录，模型不接收球或箱子的真值坐标。原图及 ACT 图像不添加参考线或标记。
+观测从 `f000000` 开始，每完成一个 0.1 秒控制拍采集一帧；帧号之差除以 10 表示经过的仿真秒数，不再逐帧存 `timestamp_s`。实测状态与动作目标分别记录，模型不接收球或箱子的真值坐标。原图及 ACT 图像不添加参考线或标记。
 
 ```text
-O0 → play A → O1 → play B → O2
+O0 → play A（O1、O2、O3）→ play B（O4、O5）
 ```
 
-A 的结束观察和 B 的开始观察共用 O1 的 `frame_id`。下一次 `decide()` 校验该观察，不重复拍照；`inspect` 回看旧图也不会改变当前帧。每次 API 请求携带累计历史，包括旧观察，但这不表示重新采样。
+A 的结束观察和 B 的开始观察共用 O3 的 `frame_id`。所有过程帧都能 inspect；批末仍只主动发送当前图。下一次 `decide()` 校验该观察，不重复拍照；`inspect` 回看旧图也不会改变当前帧。每次 API 请求携带累计历史，包括旧观察，但这不表示重新采样。
 
 帧编号在一个 episode 内唯一。`inspect` 的区域和 `read_pixels` 的坐标始终对应原图：左上角为原点，x 向右、y 向下。`region` 是含 `x, y, width, height` 的对象，区域为 `[x,x+width) × [y,y+height)`，不包含右边界和下边界。
 
@@ -128,7 +132,7 @@ A 的结束观察和 B 的开始观察共用 O1 的 `frame_id`。下一次 `deci
 | --- | --- | --- |
 | `inspect` | `question, views` | 回看指定帧的整图或局部；每个 view 指定 `label, frame_id`，可选 `region` |
 | `read_pixels` | `question, views` | 按区域网格读取原始 RGB；每个 view 指定 `label, frame_id, region, rows, columns` |
-| `history` | 可选 `start_batch, end_batch, limit` | 查询已结算动作批次及其前后帧 |
+| `history` | 可选 `mode, start, end, step, limit` | 按完整批次或等差帧查询；包含当前 pending 观测，返回续查参数 |
 | `read_guide` | 无 | 读取跨 episode 的环境经验 |
 | `write_guide` | `content` | 完整替换环境指南 |
 | `read_working` | 无 | 读取本 episode 的计划、假设和未决问题 |
@@ -138,11 +142,18 @@ A 的结束观察和 B 的开始观察共用 O1 的 `frame_id`。下一次 `deci
 
 ### 查看图片和历史
 
-`inspect` 返回真实图片及原始尺寸、选区、展示尺寸、时间和实测状态。派生展示图采用最近邻缩放，默认长边 1024 像素；不修改归档 PNG，也不把裁图注册成新环境帧。`question` 记录检查目的，工具本身不回答视觉问题。
+`inspect` 返回真实图片及原始尺寸、选区、展示尺寸、帧号和实测状态。派生展示图采用最近邻缩放，默认长边 1024 像素；不修改归档 PNG，也不把裁图注册成新环境帧。`question` 记录检查目的，工具本身不回答视觉问题。
 
 `read_pixels` 在网格单元中心采样，返回原图坐标和 RGB；不做物体识别、分割或成功判断。默认每次最多 4 个 view、总计 1024 个采样点。区域越界或参数超限返回错误，不静默裁剪。
 
-`history` 的批次范围包含两端，默认返回筛选范围内最近 10 条、最多 50 条，按批次编号升序排列。结果包含动作、预期、执行结果、前后帧和执行前实测状态；截取返回条数时说明范围，不删除原始记录。当前帧即使尚未出现在已结算批次中，也可通过 `inspect` 查看。
+`history` 不返回图片、不改变当前帧。`mode` 默认 `batch`，查询 `start/end` 均包含两端：
+
+- `history(mode="batch", start=3, end=5)` 返回第 3–5 条完整决策记录：`actions`、`execution_status`、`frame_range`、`observations` 等字段与 `actions.jsonl` 一致，包括 pending/空动作行。记录中的执行区间仍是 `[k,m)`。
+- `history(mode="frame", start=20, end=60, step=10)` 返回第 20、30、40、50、60 帧的 `frame_no/frame_id/state/batch_id`。`batch_id` 是观测的归属行，不是产生该帧的上一批次；刚接收但尚未进入下轮 decide 的末帧归属为 `null`。`step` 默认 1，只在 frame 模式允许大于 1；省略 start 时从帧 0 对齐步长。
+
+两种结果均包含 `current_frame_no`、`available_frame_range`、`available_batch_range`、`state_fields`、`returned_range`、`truncated` 和 `next_query`。每页默认 10 条、最多 50 条；指定 start 从前向后分页，省略 start 取截至 end 的最近一页。超过已存范围的 end 截至已存末尾；范围内无记录则返回空列表。结果始终升序，`next_query` 可直接作为下一次 history 参数；最新一页的续查会指向较早的遗漏范围。步长在续查时保持，不重复或跳过匹配帧。
+
+batch 单次返回的 observations 合计上限默认 500，超过返回可修正的 `HISTORY_LIMIT`，提示缩小批次范围或改用 frame 查询，不拆开记录、不删除观测。原始存储不受查询上限影响。`state` 固定为肩角、肘角、夹爪开度、线速度、角速度；它不包含球的运动状态，查看球仍需按 frame_id 调用 inspect。预期保留在模型工具调用消息中，不复制到动作记录。旧 `start_batch/end_batch` 参数已由统一的 `start/end` 替代。
 
 ### 两份笔记
 
@@ -173,13 +184,17 @@ A 的结束观察和 B 的开始观察共用 O1 的 `frame_id`。下一次 `deci
 | `turn_left` / `turn_right` | 同上 | 原地转向；秒数换算为目标转角，实际耗时由控制器决定 |
 | `arm_pose` | `pose`: `stow/reach/carry/drop` | 机械臂预设姿态 |
 | `shoulder` / `elbow` | `delta`，范围 ±0.5 rad | 相对当前实测角进行单关节微调 |
-| `open_gripper` | `{}` | 张爪，固定 0.8 秒 |
-| `close_gripper` | `{}` | 闭爪并检查稳定夹持，固定 1.2 秒 |
-| `observe` | `{}` | 停底盘、保持臂和夹爪目标，推进 0.8 秒后观察 |
+| `open_gripper` | `{}` | 张爪最多 0.8 秒，到位且观测稳定可提前结束；未到位报告失败 |
+| `close_gripper` | `{}` | 闭爪最多 1.2 秒，确认稳定夹持且观测稳定可提前结束 |
+| `observe` | 可选 `seconds`，默认 0.1，范围 0.1–3.0 | 停底盘、保持臂爪目标，至少推进一拍，稳定可提前结束；上限按 0.1 秒向下取整 |
 
 姿态在根目录 `config.py` 标定，肩/肘角度依次为：`stow=[0,2.2]`、`reach=[1.1414,1.4639]`、`carry=[0.95,1.10]`、`drop=[0.5161,2.0053]`。抓取参考是 stow 姿态下 320×240 原图中球心约 `(160,110)`、直径约 44 px；参考只用于接近，抬起后仍须验球。更完整的任务指导见 [system.txt](prompts/system.txt)。
 
-闭爪期间停止底盘、保持臂目标，固定执行 12 个控制拍。确认夹持要求同一球连续 0.1 秒接触两侧指垫内面，开度在 0.05–0.45 且波动不超过 0.02；`completed` 表示动作结束时仍确认夹持，不等于任务完成。未确认返回 `GRASP_NOT_CONFIRMED`。
+闭爪期间停止底盘、保持臂目标，最多执行 12 个控制拍。确认夹持要求同一球连续 0.1 秒接触两侧指垫内面，开度在 0.05–0.45 且波动不超过 0.02；观测相似不能替代夹持确认。`completed` 表示动作结束时仍确认夹持，不等于任务完成。未确认时不会因为图像静止提前成功，耗尽上限返回 `GRASP_NOT_CONFIRMED`。
+
+控制器复用每拍已采集的观测，`control/stability.py` 比较 3×3 像素块的 RGB 平均绝对差（先求绝对差再池化）。块差阈值为 5，全图至少 99.8% 的块不变，同时每个重叠 24×24 像素区域的变化块比例不超过 10%；不足整块的边缘按实际像素计。五维实测状态的相邻变化容差为 `(0.001 rad, 0.001 rad, 0.002, 0.002 m/s, 0.005 rad/s)`，底盘速度本身也须接近零。这些是工程容差，不是场景绝对静止的证明，均集中在 `config.py`。
+
+底盘末尾停止阶段上限 0.2 秒、机械臂末尾等待上限 0.3 秒。提前结束还须满足动作条件：机械臂误差范数不超过 0.03 rad，开爪距张开目标不超过 0.02，闭爪已确认夹持。机械臂耗尽等待上限后仍沿用原有 0.35 rad 失败检查。至少执行一拍后才比较，正常动作完成后继续同一 play 后续动作，不提前交回模型。独立控制调用若没有提供观测读取回调，会保守地执行完整等待上限；不会额外拍照或伪造稳定判定。3 秒 episode 收尾不受此机制影响。
 
 抓取提示要求同批连续两次闭爪。首次未确认时允许紧邻的第二次继续；第二次仍失败则停止后续动作。首次失败、第二次成功时仍保留首项失败和批次 `partial`。动作结束或异常时关闭新抓取判定，后续等待或抬臂不会延迟吸附。
 
@@ -205,7 +220,6 @@ output/vista/
     ├── frames/
     │   ├── f000000.png
     │   └── ...
-    ├── frame_index.jsonl
     ├── actions.jsonl
     ├── calls.jsonl
     ├── messages.jsonl
@@ -214,13 +228,19 @@ output/vista/
 
 | 文件 | 内容 |
 | --- | --- |
-| `frames/` / `frame_index.jsonl` | 初始及批次结束原图；编号、路径、尺寸、来源批次、时间和实测状态 |
-| `actions.jsonl` | 每个已结算 `play` 一条；请求、预期、结果、前后帧及执行前状态 |
+| `frames/` | 从初始帧到最后一次动作结束的全部 10Hz 原图；内存帧索引，不另写 frame_index.jsonl |
+| `actions.jsonl` | 每次 decide 先建 pending 行，再原子更新请求和结果；observations 分段保存每帧状态且不重复边界帧 |
 | `calls.jsonl` | 工具请求与结果、事件及故障诊断 |
 | `messages.jsonl` | 对话轨迹，供人工追溯模型收到的证据和给出的请求 |
-| `outcome.json` | 本集结局和外层评分，不作为模型输入 |
+| `outcome.json` | 本集结局和外层评分，以及 format_version=2、fps=10、state_fields、collection_dir；不作为模型输入 |
 
-VISTA 按动作批次保存决策证据；通用采集器按 **10 Hz 控制拍**保存训练图像、状态和动作。一个批次通常对应多个训练样本。两个目录各自分配 episode 编号，通过记录中的来源路径关联，不要求编号相同。
+VISTA 和通用采集器均按 **10 Hz 控制拍**保存观测，但职责独立：VISTA 供模型回看，原采集器保持执行前 `o_t` 与本拍 `a_t` 的训练配对。两个目录各自分配 episode 编号，通过来源路径关联，不要求编号相同。最后额外 3 秒收尾只进入原采集器。
+
+数据链是 `on_tick → env.capture_observation_tick → ObservationWindow → accept_batch_result → storage`。Env 缓存包含两端 `o_k…o_m`，读取不会消费；接收成功后 ack 保留 `o_m` 为下段起点。`decide(o_k)` 先创建 `[k,k]`、`observations=[o_k]` 的 pending 行；执行后更新为 `[k,m)`，追加 `o_(k+1)…o_(m-1)`。`o_m` 图片立即归档，状态在下一次 decide 的新行落盘。finish 保留当前空动作行；自动结束补末帧空动作行。零拍失败后继续决策时，将唯一当前观测从上一条零长度记录原子移交下一行；直接结束不重复补行。异常结算只保存可靠观测，未知进度不标成成功。进程被强制终止时，尚未交接的内存帧不能保证落盘；messages.jsonl 不提供物理任务恢复能力。
+
+采样或图片写入失败时，已完成的物理控制拍仍计数，真实动作状态和实际 `frame_range` 保留。记录额外包含 `observation_error`，`observations` 只列出实际取得的连续帧，禁止填补缺图；该 episode 中断并排除训练。如果异常清理时能从缓存重新归档完整过程，则补全同一行的观测并在原错误中标记 `recovered=true`，不修改动作执行事实，也不把该 episode 改为成功。
+
+新格式不重写已有旧 episode；旧版边界帧编号不能解释为 10Hz 帧号。
 
 HDF5、manifest、完整成功集筛选与中断恢复见[根目录 README](../../README.md)。ACT 的划分和读取见 [ACT README](../../act/README.md)。
 

@@ -41,7 +41,7 @@ BODY_ARM_BASE = f"{ARM_PREFIX}arm_base"
 FINGER_OPEN_CTRL = 0.0
 FINGER_CLOSE_CTRL = 0.05    # 满行程闭合: 左指面到+0.027, 与固定右指(-0.077)夹住0.12m球; 行程不足时正对球差2mm永远无接触
 FINGER_CLOSED_THRESHOLD = 0.008   # 仅识别闭爪命令意图，不代表手指实际闭合
-GRIPPER_CLOSE_SECONDS = 1.2       # 单次闭爪固定总时长（12 个控制拍），持续判定稳定夹持
+GRIPPER_CLOSE_SECONDS = 1.2       # 单次闭爪时间上限；确认夹持且观测稳定后可提前结束
 GRASP_DIST = 0.15                 # 球心距 TCP 此距离内才做接触检测(预筛)
 GRASP_CONTACT_TOL_M = 0.003        # 指垫内表面接触位置容差
 GRASP_NORMAL_COS_MIN = 0.7        # 接触法向须主要沿指垫内表面法向
@@ -78,8 +78,23 @@ EPISODE_SETTLE_SECONDS = 3.0
 PRIM_V = 0.30          # forward/back 速度 (m/s)
 PRIM_W = 1.0           # turn_left/right 角速度 (rad/s)
 PRIM_MAX_S = 3.0       # 单次命令最长秒数
-OBSERVE_SECONDS = 0.8  # 停止底盘后固定推进仿真，再取新图；逐控制拍记录
+OBSERVE_SECONDS = 0.1  # 默认观察上限；至少推进一拍，稳定后可提前结束
+OBSERVE_MAX_SECONDS = 3.0
+BASE_SETTLE_SECONDS = 0.2
+ARM_SETTLE_SECONDS = 0.3
+GRIPPER_OPEN_SECONDS = 0.8
+ARM_SETTLE_GOAL_TOL_RAD = 0.03  # 提前结束等待的关节误差范数；原末尾失败检查仍保留
+GRIPPER_OPEN_GOAL_TOL = 0.02    # 张开目标容差（归一化开度）
 ARM_NUDGE_MAX = 0.5    # shoulder/elbow 单次微调最大弧度
+
+# ---- 相邻控制帧的近似静止判定（仅控制器等待使用，不修改归档图片） ----
+STABILITY_BLOCK_PIXELS = 3
+STABILITY_IMAGE_EPS = 5.0          # 每块每通道平均绝对差，RGB 0–255
+STABILITY_IMAGE_SIMILARITY = 0.998
+STABILITY_LOCAL_PIXELS = 24        # 每个重叠局部区域最多允许 10% 的块变化
+STABILITY_LOCAL_CHANGED_RATIO = 0.10
+STABILITY_STATE_EPS = (0.001, 0.001, 0.002, 0.002, 0.005)  # rad, rad, 开度, m/s, rad/s
+STABILITY_BASE_SPEED_EPS = (0.002, 0.005)  # 还须速度本身接近零，不能把匀速当静止
 
 # ---- 臂预设姿态 [肩, 肘] ----
 # 同一正肘分支，避免收放时绕过高位；以下为真实伺服稳定后的近似 TCP 位置。

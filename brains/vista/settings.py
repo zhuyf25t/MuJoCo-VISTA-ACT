@@ -114,16 +114,19 @@ class VistaSettings:
     # raise MEMORY_IO_ERROR 并终止。是否精简笔记由模型显式重写决定，不自动截字。
     max_working_chars: int = 4000
 
-    # history 未传 limit 时，最多返回筛选范围内最近多少个 play 批次。
-    # Schema.default 已告知模型；storage.history 使用 filtered[-limit:] 选取，
-    # 按批次编号升序返回。省略了记录时给出 truncated=true 和 returned_range；
-    # actions.jsonl 及已有 messages 都保持完整，可换批次范围继续查询。
+    # history 每页默认条数：batch 为决策记录数，frame 为抽样后的帧数。
+    # 有 start 从前向后分页；没有 start 取最近一页。始终升序返回，
+    # truncated 与 next_query 明示尚未返回的范围，next_query 可直接重调。
     history_default_limit: int = 10
 
     # history.limit 参数允许的最大值；Schema.maximum 已告知模型。
     # 请求超过上限返回 INVALID_ARGUMENT，不把用户传入的 limit 悄悄改成 50。
-    # 只限制一次查询的返回批次数，不限制 episode 保存的总批次数。
+    # 只限制单页返回条数，不限制 episode 保存量。
     history_max_limit: int = 50
+
+    # batch 返回完整记录；其 observations 总数超过此上限则给出可修正错误，
+    # 让模型缩小范围或改用 frame 分页，不静默截断批次内部的观测。
+    history_max_observations: int = 500
 
     def __post_init__(self):
         # 配置值本身无效属于启动错误，直接 raise；不走模型的可修正工具错误流程。

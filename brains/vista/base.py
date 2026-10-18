@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from observations import FrameObservation
 
 
 @dataclass
@@ -17,6 +18,6 @@ class Brain(ABC):
     name: str = "base"
 
     @abstractmethod
-    def decide(self, obs: dict, task_text: str, tool_schemas: list[dict],
+    def decide(self, obs: FrameObservation, task_text: str, tool_schemas: list[dict],
                history: list[dict]) -> list[Decision]:
         """根据观测(含图像)/任务/工具列表/历史, 产生一批工具调用(按序执行)."""

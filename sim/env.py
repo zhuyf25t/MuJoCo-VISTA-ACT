@@ -10,6 +10,7 @@ import mujoco
 import numpy as np
 
 import config
+from observations import FrameObservation, ObservationWindow, OBSERVATION_FPS
 from control.drivers import ArmDriver, BaseDriver
 from hal import WorldInterface
 from .backend import MjRobot, MjWorld
@@ -77,6 +78,10 @@ class MobileManipEnv:
         self.robot = SimRobotFacade(self.hal, self.world)
         self.task = TaskSpec()
         self.rng = np.random.default_rng()
+        self._observation_stream_active = False
+        self._observation_buffer: list[FrameObservation] = []
+        self._observation_time: float | None = None
+        self._frame_no = 0
 
     # ---------- 生命周期 ----------
     def close(self) -> None:
@@ -90,6 +95,10 @@ class MobileManipEnv:
         self.close()
 
     def reset(self, seed: int | None = None, task: TaskSpec | None = None) -> None:
+        self._observation_stream_active = False
+        self._observation_buffer = []
+        self._observation_time = None
+        self._frame_no = 0
         if seed is not None:
             self.rng = np.random.default_rng(seed)
         if task is not None:
@@ -143,29 +152,61 @@ class MobileManipEnv:
             self.model.geom_friction[gid, 0] = 0.9 * k
 
     # ---------- 观测 / 评估 ----------
-    def get_obs(self, images: dict | None = None) -> dict:
-        """同一仿真时刻的图像和状态；调用期间不推进物理。
-
-        若传入 images，调用方须保证它来自当前时刻。
-        """
+    def _capture_frame(self, frame_no: int) -> FrameObservation:
+        """Capture public measurements and RGB at the same stopped physics boundary."""
         r = self.robot
-        images = images if images is not None else {"front": self.hal.front_image()}
         v, w = r.base_velocity
         shoulder, elbow = r.arm_q
-        opening = r.finger_opening
-        return {
-            "images": images,
-            "timestamp_s": self.hal.now(),
-            "observation": {
-                "shoulder_rad": float(shoulder), "elbow_rad": float(elbow),
-                "gripper_opening": opening,
-                "base_v_mps": float(v), "base_w_radps": float(w),
-            },
-            "arm_qpos": [float(shoulder), float(elbow)],
-            "finger": opening,
-            "base_pose": r.base_pose.tolist(),
-            "tcp_pos": r.tcp_pos.tolist(),
-        }
+        return FrameObservation(frame_no, self.hal.front_image(),
+                                (float(shoulder), float(elbow), r.finger_opening, float(v), float(w)))
+
+    @property
+    def observation_stream_active(self) -> bool:
+        return self._observation_stream_active
+
+    @property
+    def current_frame_no(self) -> int:
+        return self._frame_no
+
+    def start_observation_stream(self) -> None:
+        if self._observation_stream_active or self._observation_buffer:
+            raise RuntimeError("VISTA 观测流已经开始；新 episode 必须先 reset")
+        if not np.isclose(config.CTRL_DT, 1 / OBSERVATION_FPS, rtol=0, atol=1e-12):
+            raise RuntimeError("VISTA 帧格式要求控制频率为 10Hz")
+        initial = self._capture_frame(0)
+        self._observation_buffer = [initial]
+        self._frame_no = 0
+        self._observation_time = self.hal.now()
+        self._observation_stream_active = True
+
+    def capture_observation_tick(self) -> None:
+        if not self._observation_stream_active:
+            raise RuntimeError("VISTA 观测流未开始")
+        if self._observation_buffer[-1].frame_no != self._frame_no:
+            raise RuntimeError("OBSERVATION_UNAVAILABLE: 上一个控制拍采样失败，不能跳过缺帧继续采集")
+        now = self.hal.now()
+        if not np.isclose(now - self._observation_time, config.CTRL_DT, rtol=0, atol=1e-8):
+            raise RuntimeError("OBSERVATION_UNAVAILABLE: 采样必须恰好相隔一个完整控制拍")
+        # Physics has already completed this tick, even if rendering now fails.
+        self._frame_no += 1
+        self._observation_time = now
+        frame = self._capture_frame(self._frame_no)
+        self._observation_buffer.append(frame)
+
+    def get_obs(self) -> ObservationWindow:
+        """Read the unacknowledged inclusive window without advancing or consuming it."""
+        if not self._observation_buffer:
+            raise RuntimeError("VISTA 观测流尚无初始帧")
+        return ObservationWindow(tuple(self._observation_buffer))
+
+    def ack_observations(self, frame_no: int) -> None:
+        start, end = self._observation_buffer[0].frame_no, self._observation_buffer[-1].frame_no
+        if type(frame_no) is not int or not start <= frame_no <= end:
+            raise RuntimeError("VISTA 观测确认超出缓存范围")
+        self._observation_buffer = self._observation_buffer[frame_no - start:]
+
+    def stop_observation_stream(self) -> None:
+        self._observation_stream_active = False
 
     def success(self) -> bool:
         """真值评估: 任一球入箱即成功 (仅回合判定, 大脑不可见)."""

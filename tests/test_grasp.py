@@ -1,4 +1,4 @@
-"""Grasp admission and lifecycle: real contacts and fixed 1.2 s close actions."""
+"""Grasp admission and lifecycle with bounded waits and real contacts."""
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -45,7 +45,7 @@ def test_observe_advances_eight_recorded_ticks_without_reopening_grasp():
         layer = ToolLayer(env.robot.base, env.robot.arm, env.hal,
                           on_tick=lambda: recorded.append(env.hal.now()))
         start = env.hal.now()
-        ok, _ = layer.execute("observe", {})
+        ok, _ = layer.execute("observe", {"seconds": 0.8})
         assert ok
         assert env.hal.now() - start == pytest.approx(0.8)
         assert np.array(recorded) - start == pytest.approx(np.arange(1, 9) * 0.1)
@@ -101,9 +101,11 @@ def test_seed2_stable_bilateral_grasp_preserves_measured_aperture(monkeypatch):
         assert env.hal.attached_object() == name
         assert_no_pending_grasp(env.hal)
         assert env.hal.applied_action[2] == 0  # Command stays fully closed.
-        obs = env.get_obs(images={"front": np.zeros((2, 2, 3), dtype=np.uint8)})
-        assert 0.28 < obs["observation"]["gripper_opening"] < 0.35
-        assert "holding" not in obs["observation"]
+        env.start_observation_stream()
+        observation = env.get_obs().current.measurements()
+        env.stop_observation_stream()
+        assert 0.28 < observation["gripper_opening"] < 0.35
+        assert "holding" not in observation
 
         for pose in ("carry", "drop"):
             env.robot.arm.move_pose(pose)
@@ -117,6 +119,29 @@ def test_seed2_stable_bilateral_grasp_preserves_measured_aperture(monkeypatch):
         env.robot.arm.close_gripper(on_tick=lambda: retained.append(env.hal.attached_object()))
         assert retained == [name] * 12  # Repeated close never drops/reacquires the ball.
         assert len(events) == 1
+
+
+@pytest.mark.parametrize("seed,confirmed", [(1, False), (2, True)])
+def test_adaptive_close_requires_confirmation_before_early_return_and_keeps_carry(seed, confirmed):
+    with MobileManipEnv() as env:
+        restore_before_close(env, seed)
+        env.start_observation_stream()
+        kwargs = dict(on_tick=env.capture_observation_tick,
+                      read_observation=lambda: env.get_obs().current)
+        if confirmed:
+            assert env.robot.arm.close_gripper(**kwargs)[0]
+            assert 1 <= env.current_frame_no < 12
+            held = env.hal.attached_object()
+            assert held == "ball_2"
+            assert_no_pending_grasp(env.hal)
+            assert env.robot.arm.move_pose("carry", **kwargs)[0]
+            assert env.hal.attached_object() == held
+        else:
+            with pytest.raises(GraspNotConfirmed):
+                env.robot.arm.close_gripper(**kwargs)
+            assert env.current_frame_no == 12 and env.hal.attached_object() is None
+        assert_no_pending_grasp(env.hal)
+        assert [frame.frame_no for frame in env.get_obs().frames] == list(range(env.current_frame_no + 1))
 
 
 @pytest.mark.parametrize("phase", ["candidate", "held"])

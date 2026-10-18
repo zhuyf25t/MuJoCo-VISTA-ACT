@@ -8,6 +8,7 @@ from pathlib import Path
 
 from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.graph.message import add_messages
+from observations import FrameObservation, ObservationWindow
 
 from .base import Brain, Decision
 from .graph import build_graph
@@ -82,7 +83,7 @@ class VistaBrain(Brain):
             raise
         return {"messages": [reply], "model_calls": attempt}
 
-    def decide(self, obs, task_text, tool_schemas, history) -> list[Decision]:
+    def decide(self, obs: FrameObservation, task_text, tool_schemas, history) -> list[Decision]:
         self._require_active()
         if self._finished:
             raise RuntimeError("VISTA 已接受 finish，不能再次请求本集模型")
@@ -90,21 +91,25 @@ class VistaBrain(Brain):
             raise RuntimeError("VISTA 任务或动作定义在 episode 中途发生变化")
         try:
             check_current_round_results(self.state["messages"])
-            if self.storage.current_frame_id is None:
-                info = self.storage.archive(obs, source_batch_id=None)
+            first = self.storage.current_frame_id is None
+            if not first:
+                self.storage.check_observation(obs)
+            info = self.storage.ensure_frame(obs)
+            batch_id = self.storage.begin_batch(obs.frame_no)
+            if first:
                 context = {"task": task_text, "initial_frame_id": info["frame_id"],
                            "guide": self.storage.read_memory("guide"),
                            "working": self.storage.read_memory("working")}
                 message = image_message([(info, self.storage.load_image(info["frame_id"]))],
                                         "本次任务、初始观察和初始笔记：\n" + json.dumps(context, ensure_ascii=False))
                 self._append([message])
-            else:
-                self.storage.check_observation(obs)
             # Only the budget is reset. All previous requests, results and images remain.
             self.state["model_calls"] = 0
             self.decision_round += 1
             self.state = self.graph.invoke(self.state, {"recursion_limit": 2 * self.max_model_calls + 4})
             call = self.handoff()
+            self.storage.bind_batch_call(batch_id, call["id"],
+                                         call["args"]["actions"] if call["name"] == "play" else [])
             if call["name"] == "finish":
                 return [Decision(call["args"]["reason"], "done", {"success": call["args"]["success"]})]
             return [Decision("整批预期：" + call["args"]["expectation"], action["action"], deepcopy(action["args"]))
@@ -125,28 +130,29 @@ class VistaBrain(Brain):
         return deepcopy(calls[0])
 
     @property
-    def next_batch_id(self):
-        return self.storage.batch_count + 1
+    def active_batch_id(self):
+        return self.storage.active_batch_id
 
     def record_batch_start(self, batch_id):
         call = self.handoff()
-        if call["name"] != "play" or type(batch_id) is not int or batch_id != self.next_batch_id:
+        if call["name"] != "play" or type(batch_id) is not int or batch_id != self.active_batch_id:
             raise RuntimeError("VISTA 批次交接编号或工具类型错误")
         self.storage.event("batch_start", batch_id=batch_id, tool_call_id=call["id"], args=call["args"])
 
     def _validate_receipt(self, receipt, call):
         if (not isinstance(receipt, dict) or set(receipt) != {
                 "batch_id", "tool_call_id", "execution_status", "action_results"}
-                or type(receipt["batch_id"]) is not int or receipt["batch_id"] != self.next_batch_id
+                or type(receipt["batch_id"]) is not int or receipt["batch_id"] != self.active_batch_id
                 or receipt["tool_call_id"] != call["id"]):
             raise RuntimeError("VISTA 批次回执编号或工具调用 ID 错配")
         actions, results = call["args"]["actions"], receipt["action_results"]
         if not isinstance(results, list) or len(results) != len(actions):
             raise RuntimeError("VISTA 必须接回整批每个子动作的结果，包括未执行项")
         stopped = False
+        frame_cursor = self.storage.frame_info(self.storage.current_frame_id)["frame_no"]
         for index, (action, result) in enumerate(zip(actions, results), 1):
             if (not isinstance(result, dict) or set(result) != {
-                    "index", "action", "args", "status", "action_applied", "error"}
+                    "index", "action", "args", "status", "action_applied", "error", "frame_range"}
                     or type(result["index"]) is not int or result["index"] != index
                     or result["action"] != action["action"] or result["args"] != action["args"]):
                 raise RuntimeError("VISTA 子动作回执与原请求不匹配")
@@ -160,30 +166,45 @@ class VistaBrain(Brain):
                 raise RuntimeError("VISTA 子动作施加情况与回执状态矛盾")
             if stopped and status != "not_executed":
                 raise RuntimeError("VISTA 不可恢复的失败或取消后不能继续执行批内动作")
+            span = result["frame_range"]
+            if status == "not_executed":
+                if span is not None:
+                    raise RuntimeError("VISTA 未执行动作不能拥有执行帧区间")
+            else:
+                if (not isinstance(span, list) or len(span) != 2
+                        or any(type(value) is not int for value in span)
+                        or span[0] != frame_cursor or span[1] < span[0]):
+                    raise RuntimeError("VISTA 子动作帧区间不连续或无效")
+                frame_cursor = span[1]
             stopped = status != "completed" and not can_continue_close_pair(actions, result, index - 1)
         expected = batch_status(results, cancelled=receipt["execution_status"] == "cancelled")
         if receipt["execution_status"] != expected:
             raise RuntimeError("VISTA 批次状态与各子动作结果矛盾")
 
-    def accept_batch_result(self, receipt, obs_after):
+    def accept_batch_result(self, receipt, window: ObservationWindow | None):
         call = self.handoff()
         if call["name"] != "play":
             raise RuntimeError("VISTA 当前等待的是 finish，不能接收动作回执")
         self._validate_receipt(receipt, call)
         before = self.storage.current_frame_id
-        # Capture the archived input to this play before archive() advances the pointer.
-        observation = self.storage.frame_info(before)["observation"]
+        ends = [item["frame_range"][1] for item in receipt["action_results"] if item["frame_range"] is not None]
+        actual_end = ends[-1] if ends else int(before[1:])
         final_info, fatal = None, None
         try:
-            if obs_after is None:
+            if window is None:
                 raise RuntimeError("FRAME_UNAVAILABLE: 动作批次结束后未取得可靠车头图，程序终止。")
-            final_info = self.storage.archive(obs_after, receipt["batch_id"])
+            self.storage.validate_batch_window(receipt["batch_id"], window)
+            archived = self.storage.archive_frames(window.frames)
+            if actual_end != window.current.frame_no:
+                raise RuntimeError("OBSERVATION_UNAVAILABLE: 子动作结束帧与观测窗口不匹配")
+            final_info = archived[-1]
         except Exception as error:
             fatal = error
         # Whitelist public facts. Raw controller text can contain simulator truth.
         results = []
         for index, item in enumerate(receipt["action_results"]):
-            public = {key: deepcopy(item[key]) for key in ("index", "action", "args", "status", "action_applied")}
+            public = {key: deepcopy(item[key]) for key in (
+                "index", "action", "args", "status", "action_applied", "frame_range")}
             public["error"] = None
             if item["status"] in ("failed", "unknown"):
                 public["error"] = {"code": "ACTION_PROGRESS_UNKNOWN" if item["status"] == "unknown" else "ACTION_FAILED",
@@ -217,13 +238,11 @@ class VistaBrain(Brain):
         data = {"batch_id": receipt["batch_id"], "tool_call_id": call["id"], "before_frame_id": before,
                 "after_frame_id": final_info["frame_id"] if final_info else None,
                 "execution_status": status, "action_results": results, "frame": frame}
-        record = {key: deepcopy(data[key]) for key in (
-            "batch_id", "tool_call_id", "before_frame_id", "after_frame_id", "execution_status", "action_results")}
-        record.update(observation=observation, actions=deepcopy(call["args"]["actions"]),
-                      expectation=call["args"]["expectation"])
+        data["frame_range"] = [int(before[1:]), actual_end]
         result = {"ok": status == "completed" and final_info is not None, "data": data, "error": error}
         try:
-            self.storage.append_batch(record)
+            self.storage.complete_batch(receipt["batch_id"], actual_end, results, status,
+                                        observation_error=error if final_info is None else None)
             self.storage.event("tool_result", tool_call_id=call["id"], result=result)
             messages = [ToolMessage(tool_call_id=call["id"], content=json.dumps(result, ensure_ascii=False))]
             if final_info:
@@ -249,9 +268,17 @@ class VistaBrain(Brain):
             raise RuntimeError("VISTA finish 回执 ID 或接受状态错误")
         result = {"ok": True, "data": {"accepted": True, "model_success": call["args"]["success"],
                                       "reason": call["args"]["reason"]}, "error": None}
+        self.storage.finish_batch(self.active_batch_id)
         self.storage.event("tool_result", tool_call_id=call["id"], result=result)
         self._append([ToolMessage(tool_call_id=call["id"], content=json.dumps(result, ensure_ascii=False))])
         self._finished = True
+
+    def finalize_collection(self, window: ObservationWindow, stop_code: str) -> None:
+        """Close the visual stream before physical settling, without invoking the model."""
+        if self.storage.active_batch_id is not None:
+            raise RuntimeError("VISTA 采集结束时仍有未结算批次")
+        self.storage.archive_frames(window.frames)
+        self.storage.ensure_terminal_observation(stop_code)
 
     def end_episode(self, outcome):
         self._require_active()
@@ -259,10 +286,21 @@ class VistaBrain(Brain):
         self.storage.outcome(outcome)
         self._active = False
 
-    def abort_episode(self, error, outcome):
+    def abort_episode(self, error, outcome, window: ObservationWindow | None = None):
         self._failed, self._active = True, False
         if self.storage.episode_dir is not None:
             self.storage.diagnostic("episode_fatal", error)
+            try:
+                if window is not None:
+                    self.storage.archive_frames(window.frames)
+            except Exception as secondary:
+                error.add_note(f"VISTA 中断帧归档失败：{type(secondary).__name__}")
+            try:
+                self.storage.abort_batch()
+                self.storage.recover_observations()
+                self.storage.ensure_terminal_observation("interrupted")
+            except Exception as secondary:
+                error.add_note(f"VISTA 中断观测封口失败：{type(secondary).__name__}")
             try:
                 self.storage.outcome({**outcome, "success": False, "error": str(error)})
             except Exception as secondary:

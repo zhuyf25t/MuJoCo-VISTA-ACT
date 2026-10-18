@@ -7,14 +7,13 @@
 
 from __future__ import annotations
 
-from math import ceil
+from math import isfinite
 from typing import Any, Callable
-
-import numpy as np
 
 import config
 from hal import RobotInterface
 from .drivers import ActionFailed, ArmDriver, BaseDriver
+from .stability import ObservationReader, wait_until_stable
 
 
 class Tool:
@@ -47,54 +46,60 @@ class ToolLayer:
     """注册并执行工具; on_tick 挂记录器实现 10Hz 采样."""
 
     def __init__(self, base: BaseDriver, arm: ArmDriver, robot: RobotInterface,
-                 on_tick: Callable[[], None] | None = None):
+                 on_tick: Callable[[], None] | None = None,
+                 read_observation: ObservationReader | None = None):
         self.base = base
         self.arm = arm
         self.robot = robot
         self.on_tick = on_tick
+        self.read_observation = read_observation
         self.tools: dict[str, Tool] = {}
         self._register()
 
     def _register(self) -> None:
         def forward(seconds: float = 1.0) -> tuple[bool, str]:
-            return self.base.forward(seconds, on_tick=self.on_tick)
+            return self.base.forward(seconds, on_tick=self.on_tick, read_observation=self.read_observation)
 
         def back(seconds: float = 1.0) -> tuple[bool, str]:
-            return self.base.back(seconds, on_tick=self.on_tick)
+            return self.base.back(seconds, on_tick=self.on_tick, read_observation=self.read_observation)
 
         def turn_left(seconds: float = 1.0) -> tuple[bool, str]:
-            return self.base.turn_left(seconds, on_tick=self.on_tick)
+            return self.base.turn_left(seconds, on_tick=self.on_tick, read_observation=self.read_observation)
 
         def turn_right(seconds: float = 1.0) -> tuple[bool, str]:
-            return self.base.turn_right(seconds, on_tick=self.on_tick)
+            return self.base.turn_right(seconds, on_tick=self.on_tick, read_observation=self.read_observation)
 
         def arm_pose(pose: str) -> tuple[bool, str]:
-            return self.arm.move_pose(pose, on_tick=self.on_tick)
+            return self.arm.move_pose(pose, on_tick=self.on_tick, read_observation=self.read_observation)
 
         def shoulder(delta: float) -> tuple[bool, str]:
-            return self.arm.nudge("shoulder", delta, on_tick=self.on_tick)
+            return self.arm.nudge("shoulder", delta, on_tick=self.on_tick, read_observation=self.read_observation)
 
         def elbow(delta: float) -> tuple[bool, str]:
-            return self.arm.nudge("elbow", delta, on_tick=self.on_tick)
+            return self.arm.nudge("elbow", delta, on_tick=self.on_tick, read_observation=self.read_observation)
 
         def open_gripper() -> tuple[bool, str]:
-            return self.arm.open_gripper(on_tick=self.on_tick)
+            return self.arm.open_gripper(on_tick=self.on_tick, read_observation=self.read_observation)
 
         def close_gripper() -> tuple[bool, str]:
-            return self.arm.close_gripper(on_tick=self.on_tick)
+            return self.arm.close_gripper(on_tick=self.on_tick, read_observation=self.read_observation)
 
         def done(success: bool) -> tuple[bool, str]:            # noqa: ARG001
             return True, "任务结束"
 
-        def observe() -> tuple[bool, str]:
-            # No pose/holding feedback: simply stop drive and allow a new frame.
+        def observe(seconds: float = config.OBSERVE_SECONDS) -> tuple[bool, str]:
+            if (type(seconds) not in (int, float) or not isfinite(seconds)
+                    or not config.CTRL_DT <= seconds <= config.OBSERVE_MAX_SECONDS):
+                raise ValueError(f"observe seconds 必须介于 {config.CTRL_DT} 和 {config.OBSERVE_MAX_SECONDS}")
             self.robot.command_drive(0.0, 0.0)
-            ticks = ceil(config.OBSERVE_SECONDS / config.CTRL_DT)
-            self.robot.step_ticks(ticks, self.on_tick)
-            return True, f"已发送底盘停止指令并推进仿真 {ticks * config.CTRL_DT:.1f} 秒，可比较前后帧的变化"
+            result = wait_until_stable(self.robot, seconds, self.on_tick, self.read_observation)
+            return True, f"已发送底盘停止指令并推进仿真 {result.ticks * config.CTRL_DT:.1f} 秒，可比较前后帧的变化"
 
         add = self._add
-        add(Tool("observe", f"停止底盘并固定等待 {config.OBSERVE_SECONDS:.1f} 秒仿真时间，取得新图用于比较变化；保持机械臂和夹爪目标", {}, [], observe))
+        add(Tool("observe", "停止底盘，保持臂爪目标；至少推进一拍，观测近似稳定可提前结束等待，不证明任务成功。",
+                 {"seconds": {**_p("等待上限秒数，默认0.1；按0.1秒向下取整，保持play后续动作顺序",
+                                    mn=config.CTRL_DT, mx=config.OBSERVE_MAX_SECONDS),
+                              "default": config.OBSERVE_SECONDS}}, [], observe))
         add(Tool("forward", "底盘前进", {"seconds": _s("前进时长")}, [], forward))
         add(Tool("back", "底盘后退", {"seconds": _s("后退时长")}, [], back))
         add(Tool("turn_left", "底盘原地左转(逆时针)", {"seconds": _s("左转时长")}, [], turn_left))
@@ -115,7 +120,7 @@ class ToolLayer:
                  ["delta"], elbow))
         add(Tool("open_gripper", "张开手指(释放球)", {}, [], open_gripper))
         add(Tool("close_gripper",
-                 f"停止底盘并固定闭爪{config.GRIPPER_CLOSE_SECONDS:.1f}秒，保持臂目标；"
+                 f"停止底盘并闭爪，最多{config.GRIPPER_CLOSE_SECONDS:.1f}秒，确认夹持且观测稳定可提前完成，保持臂目标；"
                  "抓取时同一play连续提交两次。第一次未确认仍执行紧邻的第二次；第二次未确认则停止同批后续动作。"
                  "以第二次结果判断夹持，抬臂后仍须看图验球",
                  {}, [], close_gripper))

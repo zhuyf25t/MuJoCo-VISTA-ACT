@@ -37,11 +37,13 @@ def test_observation_measures_body_velocity_and_actual_joints_without_stepping(y
             return np.zeros((3, 4, 3), dtype=np.uint8)
 
         monkeypatch.setattr(hal, "front_image", capture)
-        obs = env.get_obs()
-        assert obs["observation"] == pytest.approx({
+        env.start_observation_stream()
+        obs = env.get_obs().current
+        assert obs.measurements() == pytest.approx({
             "shoulder_rad": 0.21, "elbow_rad": -0.32, "gripper_opening": 0.6,
             "base_v_mps": forward, "base_w_radps": turn})
-        assert captures == [1.25] and obs["timestamp_s"] == data.time == 1.25
+        assert captures == [1.25] and obs.frame_no == 0 and data.time == 1.25
+        assert env.get_obs().current is obs and captures == [1.25]
         data.qvel[:] = 0
         assert hal.base_velocity == pytest.approx([0, 0])  # Drive commands alone are not feedback.
 
@@ -64,6 +66,7 @@ def test_episode_closes_recording_resources_on_interruption(tmp_path, monkeypatc
 
     closed = []
     recorders = []
+    interruptions = []
     monkeypatch.setattr(mujoco, "Renderer", lambda *a, **kw: SimpleNamespace(close=lambda: closed.append(True)))
 
     def record(*args, **kwargs):
@@ -72,15 +75,22 @@ def test_episode_closes_recording_resources_on_interruption(tmp_path, monkeypatc
         return recorder
 
     def fail():
-        raise failure("interrupted")
+        error = failure("interrupted")
+        interruptions.append(error)
+        raise error
 
     monkeypatch.setattr(run_collect, "EpisodeRecorder", record)
     with MobileManipEnv() as env:
+        # The observation stream now captures o_0 before get_obs is called.
+        monkeypatch.setattr(env.hal, "front_image", lambda: np.zeros((3, 4, 3), dtype=np.uint8))
         monkeypatch.setattr(env, "get_obs", fail)
         brain = SimpleNamespace(name="vista", begin_episode=lambda *a: None,
+                                decide=lambda *a: pytest.fail("failed observation must not reach brain"),
                                 abort_episode=lambda *a: None)
-        with pytest.raises(failure):
+        with pytest.raises(failure, match="interrupted") as caught:
             run_collect.run_episode(env, brain, [], "test", tmp_path / "ep_test")
+        assert caught.value is interruptions[0] and len(interruptions) == 2
+        assert not env.observation_stream_active and env.hal.before_tick is None
     assert len(closed) == len(config.REC_CAMS)
     assert recorders[0]._f_dec.closed and recorders[0]._f_traj.closed
     meta = json.loads((tmp_path / "ep_test/meta.json").read_text(encoding="utf-8"))

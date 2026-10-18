@@ -13,7 +13,7 @@ import config
 from .model import image_message
 from .settings import VistaSettings
 from .state import validate_reply
-from .storage import VistaStorage
+from .storage import HistoryQueryError, VistaStorage
 
 
 class _Arguments(ValueError):
@@ -120,6 +120,11 @@ def action_schemas(tool_schemas: list[dict]) -> dict[str, dict]:
         elif name in ("shoulder", "elbow"):
             schema["properties"]["delta"].update(
                 minimum=-config.ARM_NUDGE_MAX, maximum=config.ARM_NUDGE_MAX)
+        elif name == "observe":
+            schema["properties"]["seconds"] = {
+                "type": "number", "minimum": config.CTRL_DT, "maximum": config.OBSERVE_MAX_SECONDS,
+                "default": config.OBSERVE_SECONDS,
+                "description": "等待上限秒数，默认0.1；按0.1秒向下取整，观测稳定可提前结束，至少执行一拍"}
         definitions[name] = {"description": description, "parameters": schema}
     if set(definitions) != names:
         raise RuntimeError("VISTA 需要完整的十个控制动作定义，请传入 ToolLayer 的工具 Schema")
@@ -154,23 +159,27 @@ def tool_schemas(settings: VistaSettings, actions: dict) -> list[dict]:
     guide_scope = "scope=environment：同一套场景、相机和控制设定的经验，跨多个 episode 保留。"
     working_scope = "scope=episode：从环境初始化到任务结束的一次完整实验，跨工具调用和动作批次保留，新实验另建文件。"
     definitions = [
-        ("inspect", "按 frame_id 读取当前或历史归档原图/裁剪图；图旁 observation 和 timestamp_s 属于该原图采样时刻。"
+        ("inspect", "按 frame_id 读取当前或历史归档原图/裁剪图；图旁 observation 属于该原图采样时刻，帧号间隔为0.1秒。"
          "通过图片索引查找，不依赖 history 中已有动作记录；不推进环境、不回答 question、不改变当前观测。" + coordinates,
          inspect_schema),
         ("read_pixels", "从原图区域的均匀网格中心读取 RGB 和坐标，不识别物体；"
          f"总点数为所有 views 的 rows×columns 之和，最多 {settings.max_samples} 点，这是上限而非建议用量。"
          "先用 inspect 定位，只对待核实的小区域稀疏取色，不用密集取色代替看图；小块参考色通常用3×3点即可。" + coordinates,
          pixels_schema),
-        ("history", "查询本 episode 已结束或中断并结算的 play 批次；尚未提交或正在执行的批次不在历史中，初始为空。"
-         "每批结束时只追加一条记录，包含全部子动作 actions、expectation、execution_status、action_results 及前后帧编号。"
-         "observation 只保存本批执行前的五维实测状态，严格对应 before_frame_id；不是目标命令或执行后状态。"
-         "字段为 shoulder_rad、elbow_rad（实际角度，rad），gripper_opening（实际连续开度，0 全闭、1 全开），"
-         "base_v_mps（车体前向实际速度，m/s，正前进），base_w_radps（绕车体竖轴实际角速度，rad/s，正左转）。"
-         "after_frame_id 仅关联执行后观测，不额外展开一组执行后状态；它也是下一批的 before_frame_id。"
-         "当前观测已随图片提供，即使尚无对应 play 记录也可用 inspect 查看。返回帧编号，不自动返回图片；用 inspect 按编号查看。"
-         "无范围时取最近 limit 批，始终按编号升序。",
-         _object({"start_batch": _integer("包含的起始批次", 1), "end_batch": _integer("包含的结束批次", 1),
-                  "limit": {**_integer("最多返回的批次数，不是动作数", 1, settings.history_max_limit),
+        ("history", "查询本 episode 历史，不推进环境、不改变当前帧、不自动返回图片；用inspect查看返回的frame_id。"
+         "mode=batch返回完整决策记录（含pending/结束行）、动作、实际执行区间及observations；"
+         "记录的frame_range=[k,m]表示执行区间[k,m)，完成批次存o_k至o_(m-1)，o_m归下一条；pending行已有当前观测。"
+         "mode=frame按start,start+step,...<=end返回frame_no/frame_id/state/batch_id；"
+         "batch_id表示观测归属记录，尚未归属时为null。state顺序由state_fields说明。"
+         "查询start/end均包含两端；有start从前向后分页，没有start取截至end的最近一页；"
+         "frame省略start时抽样从0对齐。返回当前帧、可查范围、truncated和可直接重调的next_query。"
+         f"batch单页最多{settings.history_max_observations}个观测，超过须缩小范围或改用frame；不会拆开批次。",
+         _object({"mode": {"type": "string", "enum": ["batch", "frame"], "default": "batch",
+                           "description": "batch按决策记录查询；frame按控制帧查询"},
+                  "start": _integer("包含的起点：batch从1编号，frame从0编号；省略则取最近一页", 0),
+                  "end": _integer("包含的终点；省略或超过已存范围时截至当前可查询末尾", 0),
+                  "step": {**_integer("仅frame可设大于1的步长；从start开始等差抽样", 1), "default": 1},
+                  "limit": {**_integer("最多返回的批次或抽样帧条数，不是动作数", 1, settings.history_max_limit),
                             "default": settings.history_default_limit}})),
         ("read_guide", "读取稳定指南。" + guide_scope, _object({})),
         ("write_guide", "完整替换指南，不是追加；保留需要的旧内容。" + guide_scope,
@@ -180,13 +189,13 @@ def tool_schemas(settings: VistaSettings, actions: dict) -> list[dict]:
          _object({"content": _text("完整新版草稿", settings.max_working_chars)}, ("content",))),
         ("play", "提交一批按数组顺序连续执行的动作，支持 arm_pose 预设和 shoulder/elbow 单关节微调。"
          "批内不再调用模型，结束后反馈最终图及同一时刻的 observation 实测状态。"
-         "history 本批 observation 记录的是执行前状态。必须独占本条模型回复；expectation 是整批预期，不是成功证明。",
+         "全过程按10Hz归档，可通过帧号回看；history 的 observations 记录本批执行区间内各帧。必须独占本条模型回复；expectation 是整批预期，不是成功证明。",
          _object({"actions": {"type": "array", "minItems": 1, "maxItems": settings.max_actions,
                                "items": {"oneOf": action_variants}},
                   "expectation": _text("整批结束后预期看见的变化；若用于验证，说明要直接看清什么、支持或否定假设的结果，以及何时仍无法判断", settings.max_question_chars),
                   "basis_frame_id": _text("必须等于当前观察的 frame_id，不能使用回看的旧图", 64)},
                  ("actions", "expectation", "basis_frame_id"))),
-        ("finish", "提出结束当前 episode，success 仅为模型自评。独占一条回复，不执行动作、不新增图片或 play 批次。",
+        ("finish", "提出结束当前 episode，success 仅为模型自评。独占一条回复，不执行动作、不新增图片；保留当前观测的空动作结束记录。",
          _object({"success": {"type": "boolean", "description": "模型根据视觉自评任务是否完成"},
                   "reason": _text("结束原因及不确定性", settings.max_question_chars),
                   "evidence_frame_ids": {"type": "array", "maxItems": settings.max_views,
@@ -267,10 +276,16 @@ class VistaTools:
             if name in ("write_guide", "write_working"):
                 return success(self.storage.write_memory(name.removeprefix("write_"), args["content"])), []
             if name == "history":
-                if args.get("start_batch", 1) > args.get("end_batch", math.inf):
-                    raise _Arguments("INVALID_ARGUMENT", "start_batch 不能大于 end_batch")
-                return success(self.storage.history(args.get("start_batch"), args.get("end_batch"),
-                                                     args.get("limit", self.settings.history_default_limit))), []
+                mode = args.get("mode", "batch")
+                if args.get("start", 0) > args.get("end", math.inf):
+                    raise _Arguments("INVALID_ARGUMENT", "start 不能大于 end")
+                if mode == "batch" and (args.get("step", 1) != 1
+                                        or any(args.get(key) == 0 for key in ("start", "end"))):
+                    raise _Arguments("INVALID_ARGUMENT", "batch 编号从1开始且不能跳步；按帧抽样请用 mode=frame")
+                try:
+                    return success(self.storage.history(**args)), []
+                except HistoryQueryError as error:
+                    raise _Arguments("HISTORY_LIMIT", str(error), "缩小批次范围，或用 mode=frame 查询所需帧") from None
             prepared = self._views(args, pixels=name == "read_pixels")
             images, output, total = [], [], 0
             for view, info, region in prepared:
@@ -284,7 +299,7 @@ class VistaTools:
                     size = (max(1, round(width * scale)), max(1, round(height * scale)))
                     rendered = original.crop((x, y, x + width, y + height)).resize(size, Image.Resampling.NEAREST)
                     meta["rendered_size"] = list(size)
-                    images.append(({**meta, "timestamp_s": info["timestamp_s"],
+                    images.append(({**meta, "frame_no": info["frame_no"],
                                     "observation": info["observation"]}, rendered))
                 else:
                     rows, columns = view["rows"], view["columns"]

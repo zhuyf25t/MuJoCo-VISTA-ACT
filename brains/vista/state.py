@@ -20,6 +20,7 @@ class ActionResult(TypedDict):
     status: str
     action_applied: bool | None
     error: dict | None
+    frame_range: list[int] | None
 
 
 class BatchReceipt(TypedDict):
@@ -86,7 +87,7 @@ def action_result(index: int, action: dict, status: str) -> ActionResult:
                  "message": "控制执行失败" if status == "failed" else "控制调用未正常完成，无法确认施加进度",
                  "can_retry": status == "failed"}
     return {"index": index, "action": action["action"], "args": dict(action["args"]),
-            "status": status, "action_applied": applied, "error": error}
+            "status": status, "action_applied": applied, "error": error, "frame_range": None}
 
 
 def can_continue_close_pair(actions: list[dict], result: ActionResult, index: int) -> bool:

@@ -1,4 +1,4 @@
-"""Immutable image/state snapshots, fixed notes and append-only JSONL logs."""
+"""Immutable control frames, atomic decision records, notes and debug logs."""
 
 from __future__ import annotations
 
@@ -10,14 +10,18 @@ import os
 import re
 import tempfile
 from copy import deepcopy
-from numbers import Real
 from pathlib import Path
 
 import numpy as np
 from langchain_core.messages import BaseMessage, message_to_dict
 from PIL import Image
+from observations import FrameObservation, ObservationWindow, OBSERVATION_FPS, STATE_FIELDS
 
 from .settings import VistaSettings
+
+
+class HistoryQueryError(ValueError):
+    """A recoverable oversized query, not corrupted stored history."""
 
 
 def _json_safe(value):
@@ -56,6 +60,10 @@ class VistaStorage:
         self._frame_hashes: dict[str, str] = {}
         self.current_frame_id: str | None = None
         self.batch_count = 0
+        self.active_batch_id: int | None = None
+        self._records: list[dict] = []
+        self._last_owned_frame: int | None = None
+        self._metadata: dict = {}
 
     def begin_episode(self, collection_dir: Path, task_text: str) -> None:
         try:
@@ -76,7 +84,7 @@ class VistaStorage:
                 "未决疑点：暂无。每项记录待验证状态或矛盾、关联帧、阻塞的计划、下一检查和解决标准。\n"
                 "已解决疑点与直接证据：暂无。\n相关帧编号：暂无。\n",
                 encoding="utf-8")
-            for name in ("frame_index", "actions", "calls", "messages"):
+            for name in ("actions", "calls", "messages"):
                 (episode / f"{name}.jsonl").touch(exist_ok=False)
         except OSError:
             raise RuntimeError("MEMORY_IO_ERROR: 无法创建 VISTA 图片、笔记或日志目录") from None
@@ -84,6 +92,12 @@ class VistaStorage:
         self._frame_hashes = {}
         self.current_frame_id = None
         self.batch_count = 0
+        self.active_batch_id = None
+        self._records = []
+        self._last_owned_frame = None
+        self._metadata = {"format_version": 2, "fps": OBSERVATION_FPS,
+                          "state_fields": list(STATE_FIELDS),
+                          "collection_dir": str(Path(collection_dir).resolve()), "task": task_text}
         self.read_memory("guide")
         self.read_memory("working")
         self.event("episode_start", collection_dir=str(Path(collection_dir).resolve()), task=task_text)
@@ -94,7 +108,7 @@ class VistaStorage:
         return self.episode_dir
 
     def append(self, name: str, record: dict) -> None:
-        if name not in ("frame_index", "actions", "calls", "messages"):
+        if name not in ("calls", "messages"):
             raise RuntimeError("VISTA 未知日志类型")
         path = self._episode() / f"{name}.jsonl"
         try:
@@ -130,61 +144,52 @@ class VistaStorage:
                     content[index] = {"type": "image_reference", **reference}
         self.append("messages", data)
 
-    @staticmethod
-    def front_rgb(obs: dict) -> np.ndarray:
-        rgb = obs.get("images", {}).get("front") if isinstance(obs, dict) else None
-        if (not isinstance(rgb, np.ndarray) or rgb.dtype != np.uint8 or rgb.ndim != 3
-                or rgb.shape[2] != 3 or min(rgb.shape[:2]) < 1):
-            raise RuntimeError("FRAME_UNAVAILABLE: VISTA 需要 images.front 的非空 uint8 RGB 原图")
-        return rgb
-
-    @staticmethod
-    def observation_state(obs: dict) -> dict:
-        """Copy only public measurements; never forward arbitrary environment fields."""
-        def finite(value):
-            if isinstance(value, bool) or not isinstance(value, Real):
-                raise ValueError
-            value = float(value)
-            if not math.isfinite(value):
-                raise ValueError
-            return value
-
-        try:
-            state = obs["observation"]
-            public = {key: finite(state[key]) for key in (
-                "shoulder_rad", "elbow_rad", "gripper_opening", "base_v_mps", "base_w_radps")}
-            if not 0 <= public["gripper_opening"] <= 1:
-                raise ValueError
-            return {"timestamp_s": finite(obs["timestamp_s"]), "observation": public}
-        except (KeyError, TypeError, ValueError, OverflowError):
-            raise RuntimeError("OBSERVATION_UNAVAILABLE: 需要有效采样时间和五维实测状态，夹爪开度须在 [0,1]") from None
-
-    def archive(self, obs: dict, source_batch_id: int | None) -> dict:
-        rgb = self.front_rgb(obs)
-        snapshot = self.observation_state(obs)
-        frame_id = f"f{len(self.frames):06d}"
+    def ensure_frame(self, obs: FrameObservation) -> dict:
+        if not isinstance(obs, FrameObservation):
+            raise RuntimeError("OBSERVATION_UNAVAILABLE: 需要带控制帧号的同步观测")
+        rgb, frame_id = obs.image, obs.frame_id
+        if frame_id in self.frames:
+            saved = self.frame_info(frame_id)
+            if saved["state"] != list(obs.state) or not np.array_equal(rgb, np.asarray(self.load_image(frame_id))):
+                raise RuntimeError("VISTA 已归档帧的图像或实测状态发生变化")
+            return saved
+        if obs.frame_no != len(self.frames):
+            raise RuntimeError("OBSERVATION_UNAVAILABLE: VISTA 帧号不连续，禁止补造缺帧")
         path = self._episode() / "frames" / f"{frame_id}.png"
         if not path.parent.resolve().is_relative_to(self._episode()):
             raise RuntimeError("FRAME_UNAVAILABLE: 图片目录已经移出本 episode")
+        created = False
         try:
             buffer = io.BytesIO()
             Image.fromarray(rgb).save(buffer, format="PNG")
             contents = buffer.getvalue()
             # Exclusive creation: a published original is never overwritten.
             with path.open("xb") as handle:
+                created = True
                 handle.write(contents)
                 handle.flush()
+                os.fsync(handle.fileno())
             info = {"episode_id": self._episode().name, "frame_id": frame_id,
+                    "frame_no": obs.frame_no,
                     "camera": "front", "path": f"frames/{frame_id}.png",
                     "width": int(rgb.shape[1]), "height": int(rgb.shape[0]),
-                    "source_batch_id": source_batch_id, **snapshot}
-            self.append("frame_index", info)
+                    "source_batch_id": self.active_batch_id,
+                    "state": list(obs.state), "observation": obs.measurements()}
         except (OSError, ValueError):
+            if created:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
             raise RuntimeError("FRAME_UNAVAILABLE: 无法保存 VISTA 原始 PNG，未发布该帧") from None
         self.frames[frame_id] = info
         self._frame_hashes[frame_id] = hashlib.sha256(contents).hexdigest()
         self.current_frame_id = frame_id
         return deepcopy(info)
+
+    def archive_frames(self, frames) -> list[dict]:
+        window = ObservationWindow(tuple(frames))
+        return [self.ensure_frame(frame) for frame in window.frames]
 
     def frame_info(self, frame_id: str) -> dict:
         if frame_id not in self.frames:
@@ -210,13 +215,10 @@ class VistaStorage:
         except (OSError, ValueError):
             raise RuntimeError(f"FRAME_UNAVAILABLE: 原图 {frame_id} 丢失、损坏或被修改") from None
 
-    def check_observation(self, obs: dict) -> None:
-        rgb = self.front_rgb(obs)
-        snapshot = self.observation_state(obs)
-        saved = self.frame_info(self.current_frame_id)
-        if (any(snapshot[key] != saved[key] for key in snapshot)
-                or not np.array_equal(rgb, np.asarray(self.load_image(self.current_frame_id)))):
+    def check_observation(self, obs: FrameObservation) -> None:
+        if not isinstance(obs, FrameObservation) or obs.frame_id != self.current_frame_id:
             raise RuntimeError("VISTA 当前观察与已接收的批次最终图或实测状态不一致，请先接回真实批次结果")
+        self.ensure_frame(obs)
 
     def _memory_path(self, kind: str) -> Path:
         if kind not in ("guide", "working"):
@@ -246,44 +248,226 @@ class VistaStorage:
             raise RuntimeError(f"MEMORY_IO_ERROR: 无法完整写入 {kind}.md") from None
         return {**self.read_memory(kind), "written": True}
 
-    def append_batch(self, record: dict) -> None:
-        if record["batch_id"] != self.batch_count + 1:
-            raise RuntimeError("VISTA 批次编号不连续或重复结算")
-        self.append("actions", record)
-        self.batch_count += 1
+    def _commit_records(self, records: list[dict], active_batch_id: int | None) -> None:
+        """Publish disk first; a failed replacement must not advance memory state."""
+        self._validate_records(records)
+        path = self._episode() / "actions.jsonl"
+        try:
+            if not path.is_file() or not path.resolve().is_relative_to(self._episode()):
+                raise OSError("actions unavailable")
+            _atomic_text(path, "".join(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n"
+                                      for row in records))
+        except (OSError, UnicodeError, TypeError, ValueError):
+            raise RuntimeError("STORAGE_IO_ERROR: 无法原子更新 VISTA actions.jsonl") from None
+        self._records = records
+        self.batch_count = len(records)
+        self.active_batch_id = active_batch_id
+        owned = [obs["frame_id"] for record in records for obs in record["observations"]]
+        self._last_owned_frame = int(owned[-1][1:]) if owned else None
 
-    def history(self, start_batch=None, end_batch=None, limit=10) -> dict:
+    def _validate_records(self, records: list[dict]) -> None:
+        expected_frame = 0
+        previous_end = 0
+        for index, record in enumerate(records, 1):
+            required = {"batch_id", "tool_call_id", "frame_range", "actions", "observations", "execution_status"}
+            if not required <= set(record) or set(record) - required - {"observation_error"}:
+                raise ValueError("invalid record fields")
+            start, end = record["frame_range"]
+            if (record["batch_id"] != index or type(start) is not int or type(end) is not int
+                    or start != previous_end or end < start
+                    or not isinstance(record["actions"], list)
+                    or record["execution_status"] not in (
+                        "pending", "completed", "partial", "failed", "unknown", "cancelled", "finished", "interrupted")):
+                raise ValueError("invalid decision record")
+            observed = record["observations"]
+            incomplete = record.get("observation_error") is not None
+            if (end > start and (len(observed) > end - start if incomplete else len(observed) != end - start)
+                    or end == start and len(observed) not in (0, 1)):
+                raise ValueError("observation count does not match frame range")
+            for offset, obs in enumerate(observed):
+                frame = self.frames[f"f{expected_frame:06d}"]
+                if (start + offset != expected_frame
+                        or obs != {"frame_id": frame["frame_id"], "state": frame["state"]}):
+                    raise ValueError("observations are repeated, missing or differ from archived state")
+                expected_frame += 1
+            previous_end = end
+
+    def _active_record(self, batch_id: int) -> dict:
+        if type(batch_id) is not int or batch_id != self.active_batch_id:
+            raise RuntimeError("VISTA 批次编号不匹配或已经结算")
+        return self._records[-1]
+
+    def observation_record(self, frame_no: int) -> dict:
+        info = self.frame_info(f"f{frame_no:06d}")
+        return {"frame_id": info["frame_id"], "state": info["state"]}
+
+    def begin_batch(self, start_frame: int) -> int:
+        if self.active_batch_id is not None:
+            raise RuntimeError("VISTA 上一批次尚未结算")
+        if self.current_frame_id != f"f{start_frame:06d}":
+            raise RuntimeError("VISTA 新批次必须从当前帧开始")
+        records = deepcopy(self._records)
+        if self._last_owned_frame == start_frame:
+            # A zero-tick failure may be followed by a recovery decision on the same
+            # frame. Move ownership atomically instead of duplicating this snapshot.
+            if not records or records[-1]["frame_range"] != [start_frame, start_frame]:
+                raise RuntimeError("VISTA 起始观测已被其他非空区间占用")
+            records[-1]["observations"] = []
+        batch_id = len(records) + 1
+        records.append({"batch_id": batch_id, "tool_call_id": None,
+                        "frame_range": [start_frame, start_frame], "actions": [],
+                        "observations": [self.observation_record(start_frame)], "execution_status": "pending"})
+        self._commit_records(records, batch_id)
+        return batch_id
+
+    def bind_batch_call(self, batch_id: int, tool_call_id: str, actions: list[dict]) -> None:
+        record = self._active_record(batch_id)
+        if record["tool_call_id"] is not None or not isinstance(tool_call_id, str) or not tool_call_id:
+            raise RuntimeError("VISTA 交接调用重复绑定或缺少 ID")
+        records = deepcopy(self._records)
+        records[-1]["tool_call_id"] = tool_call_id
+        records[-1]["actions"] = deepcopy(actions)
+        self._commit_records(records, batch_id)
+
+    def validate_batch_window(self, batch_id: int, window: ObservationWindow) -> None:
+        record = self._active_record(batch_id)
+        if not isinstance(window, ObservationWindow) or window.frames[0].frame_no != record["frame_range"][0]:
+            raise RuntimeError("OBSERVATION_UNAVAILABLE: 批次观测窗口起点不匹配")
+        self.ensure_frame(window.frames[0])
+
+    def complete_batch(self, batch_id: int, end_frame: int, action_results: list[dict],
+                       execution_status: str, observation_error: dict | None = None) -> None:
+        record = self._active_record(batch_id)
+        start = record["frame_range"][0]
+        saved_end = self.frames[self.current_frame_id]["frame_no"]
+        if end_frame < start or (observation_error is None and end_frame != saved_end):
+            raise RuntimeError("VISTA 批次终点不是当前已归档帧")
+        if len(action_results) != len(record["actions"]):
+            raise RuntimeError("VISTA 批次必须结算所有请求动作")
+        records = deepcopy(self._records)
+        updated = records[-1]
+        updated["observations"] = [self.observation_record(i)
+                                   for i in range(start, min(max(start + 1, end_frame), saved_end + 1))]
+        updated["frame_range"] = [start, end_frame]
+        updated["actions"] = deepcopy(action_results)
+        updated["execution_status"] = execution_status
+        if observation_error is not None:
+            updated["observation_error"] = deepcopy(observation_error)
+        self._commit_records(records, None)
+
+    def finish_batch(self, batch_id: int) -> None:
+        if self._active_record(batch_id)["actions"]:
+            raise RuntimeError("VISTA finish 不能结算有待执行动作的批次")
+        records = deepcopy(self._records)
+        records[-1]["execution_status"] = "finished"
+        self._commit_records(records, None)
+
+    def ensure_terminal_observation(self, stop_code: str = "finished") -> None:
+        if self.active_batch_id is not None:
+            raise RuntimeError("VISTA 结束前必须结算当前批次")
+        if self.current_frame_id is None:
+            return
+        end = self.frames[self.current_frame_id]["frame_no"]
+        if self._last_owned_frame == end:
+            return
+        batch_id = self.begin_batch(end)
+        records = deepcopy(self._records)
+        records[-1]["execution_status"] = "interrupted" if stop_code == "interrupted" else "finished"
+        self._commit_records(records, None)
+
+    def abort_batch(self) -> None:
+        if self.active_batch_id is None:
+            return
+        record = self._records[-1]
+        results = deepcopy(record["actions"])
+        for index, result in enumerate(results, 1):
+            result.update(index=index, status="unknown", action_applied=None, frame_range=None,
+                          error={"code": "EXECUTION_INTERRUPTED", "message": "中断前未收到可靠执行回执"})
+        end = self.frames[self.current_frame_id]["frame_no"]
+        self.complete_batch(self.active_batch_id, end, results, "interrupted")
+
+    def recover_observations(self) -> None:
+        """Attach successfully retried PNGs to a failed collection, keeping action facts."""
+        if not self._records or "observation_error" not in self._records[-1]:
+            return
+        record = self._records[-1]
+        start, end = record["frame_range"]
+        saved_end = self.frames[self.current_frame_id]["frame_no"]
+        if saved_end > end:
+            raise RuntimeError("VISTA 恢复观测超过已知执行范围")
+        records = deepcopy(self._records)
+        records[-1]["observations"] = [self.observation_record(i)
+                                       for i in range(start, min(max(start + 1, end), saved_end + 1))]
+        if saved_end == end:
+            records[-1]["observation_error"]["recovered"] = True
+        self._commit_records(records, self.active_batch_id)
+
+    def history(self, start=None, end=None, limit=None, *, mode="batch", step=1) -> dict:
+        """Read complete batches or sampled frames; ranges include both ends.
+
+        Explicit starts page forward. Without a start, show the latest page;
+        next_query then points to the older omitted range, without losing frames.
+        """
+        limit = self.settings.history_default_limit if limit is None else limit
+        minimum = 1 if mode == "batch" else 0
+        if (mode not in ("batch", "frame")
+                or any(value is not None and (type(value) is not int or value < minimum)
+                       for value in (start, end))
+                or (start is not None and end is not None and start > end)
+                or type(step) is not int or step < 1 or (mode == "batch" and step != 1)
+                or type(limit) is not int or not 1 <= limit <= self.settings.history_max_limit):
+            raise ValueError("invalid history query")
         try:
             path = self._episode() / "actions.jsonl"
             if not path.resolve().is_relative_to(self._episode()):
                 raise ValueError("history path changed")
             entries = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
-            required = {"batch_id", "tool_call_id", "observation", "actions", "expectation", "before_frame_id",
-                        "after_frame_id", "execution_status", "action_results"}
-            if len(entries) != self.batch_count:
-                raise ValueError("history count mismatch")
-            for index, entry in enumerate(entries, 1):
-                if (not isinstance(entry, dict) or not required <= entry.keys()
-                        or type(entry["batch_id"]) is not int or entry["batch_id"] != index
-                        or not isinstance(entry["actions"], list)
-                        or not isinstance(entry["action_results"], list)
-                        or len(entry["actions"]) != len(entry["action_results"])):
-                    raise ValueError("invalid batch record")
-                if entry["observation"] != self.frames[entry["before_frame_id"]]["observation"]:
-                    raise ValueError("batch observation does not match its input frame")
-            filtered = [{key: entry[key] for key in required} for entry in entries
-                        if (start_batch is None or entry["batch_id"] >= start_batch)
-                        and (end_batch is None or entry["batch_id"] <= end_batch)]
+            if entries != self._records:
+                raise ValueError("history changed outside storage")
+            self._validate_records(entries)
         except (OSError, UnicodeError, ValueError, TypeError, KeyError):
             raise RuntimeError("HISTORY_UNAVAILABLE: 批次历史丢失或损坏") from None
-        selected = filtered[-limit:]
-        return {"batches": selected, "truncated": len(filtered) > limit,
-                "returned_range": ([selected[0]["batch_id"], selected[-1]["batch_id"]]
-                                   if selected else None)}
+        current = int(self.current_frame_id[1:]) if self.current_frame_id is not None else None
+        last = len(entries) if mode == "batch" else current
+        lower = minimum if start is None else start
+        upper = (last if end is None else min(end, last)) if last is not None else -1
+        numbers = range(lower, upper + 1, step)
+        selected = numbers[-limit:] if start is None else numbers[:limit]
+        truncated = len(selected) < len(numbers)
+        next_query = None
+        if truncated:
+            next_query = {"mode": mode, "start": lower if start is None else selected[-1] + step,
+                          "end": selected[0] - step if start is None else upper, "limit": limit}
+            if mode == "frame":
+                next_query["step"] = step
+        result = {"mode": mode, "current_frame_no": current,
+                  "available_frame_range": [0, current] if current is not None else None,
+                  "available_batch_range": [1, len(entries)] if entries else None,
+                  "state_fields": list(STATE_FIELDS), "truncated": truncated,
+                  "returned_range": [selected[0], selected[-1]] if selected else None,
+                  "next_query": next_query}
+        if mode == "batch":
+            batches = [entries[number - 1] for number in selected]
+            count = sum(len(row["observations"]) for row in batches)
+            if count > self.settings.history_max_observations:
+                raise HistoryQueryError(
+                    f"所选批次包含 {count} 个观测，单次上限 {self.settings.history_max_observations}；"
+                    "请缩小批次范围或改用 mode=frame。"
+                    f"所选批次帧范围为 [{batches[0]['frame_range'][0]}, {batches[-1]['frame_range'][1]}]；"
+                    "frame 查询可用 step 抽样、limit 分页，批次记录不会被拆开或省略观测。")
+            result["batches"] = batches
+        else:
+            # Ownership follows observations, not the batch that produced a frame.
+            # A just-accepted boundary has no owner until the next decide/finish.
+            owners = {obs["frame_id"]: row["batch_id"] for row in entries for obs in row["observations"]}
+            result["frames"] = [
+                {"frame_no": number, **self.observation_record(number),
+                 "batch_id": owners.get(f"f{number:06d}")} for number in selected]
+        return result
 
     def outcome(self, outcome: dict) -> None:
         try:
             _atomic_text(self._episode() / "outcome.json",
-                         json.dumps(outcome, ensure_ascii=False, indent=2, allow_nan=False) + "\n")
+                         json.dumps({**outcome, **self._metadata}, ensure_ascii=False, indent=2, allow_nan=False) + "\n")
         except (OSError, ValueError, TypeError):
             raise RuntimeError("STORAGE_IO_ERROR: 无法保存 VISTA episode 结局") from None
