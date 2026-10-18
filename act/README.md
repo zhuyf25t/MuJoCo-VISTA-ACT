@@ -1,8 +1,10 @@
-# ACT：先把训练过程看清楚
+# ACT：从示范到控制策略
 
-当前实现支持数据准备、训练、离线验证、checkpoint 恢复、独立推理和 MuJoCo 闭环评估。
+本目录实现 Action Chunking with Transformers：使用成功示范训练策略，根据车头图像和机器人实测状态预测未来动作块。包含数据准备、训练、离线验证、checkpoint 恢复、独立推理和 MuJoCo 策略评估。
+
 默认 **K=32、10 Hz、单张 320×240 RGB、五维实测状态、五维目标动作、batch size=8**。
-这里只提供代码和命令；不会在导入模块时划分数据、启动训练或修改采集目录。
+
+使用顺序为 `prepare → train → rollout`。安装与云端环境配置见[项目 README](../README.md#环境配置)，逐模块实现逻辑见 [ACT 模块详解](README_log.md)。
 
 ## 各文件的责任
 
@@ -33,7 +35,7 @@
 
 ## 数据和跨机器迁移
 
-沿用采集器的 `mobile_act_v1`，不修改正在采集的 manifest：
+数据使用采集器的 `mobile_act_v1` 契约：
 
 ```text
 data/act_v1/
@@ -75,7 +77,7 @@ python -m pip install -r requirements.txt
 ResNet-18 原版含分类头约 1,169 万参数；本项目移除分类头，只使用空间特征图，
 并采用 FrozenBatchNorm，骨干约 1,117 万可训练参数。FrozenBatchNorm 固定的是 BN
 统计量与仿射量，卷积权重仍参与微调；CNN 学习率为 `1e-5`，其他网络为 `1e-4`。
-ACT 的 Transformer、投影和动作头从随机初始化开始。当前默认模型实测共有
+ACT 的 Transformer、投影和动作头从随机初始化开始。默认配置共有
 59,853,573 个可训练参数，其中骨干 11,166,912 个；启动训练时会再次打印实际数量。
 
 默认调用 torchvision 的 `ResNet18_Weights.IMAGENET1K_V1`，首次初始化会从
@@ -88,12 +90,12 @@ ACT 的 Transformer、投影和动作头从随机初始化开始。当前默认�
 图像在 Dataset/policy 中转为 `[camera,3,H,W]` 并除以 255，进入 model 后只做一次
 ImageNet 通道标准化；保持 240×320，不做 torchvision 分类模型默认的中心裁剪。
 
-## 数据划分：由你决定后显式运行
+## 数据划分
 
-以下均为命令示例，没有实际划分当前数据。两种方式任选其一。
+选择一个尚不存在的实验目录。以下两种方式任选其一：按场景 seed 随机分组，或提供显式 episode 清单。
 
 ```bash
-# 比例由用户指定；按场景 seed 分组，而非按帧随机切分。
+# 按场景 seed 分组，验证比例为 20%；同一场景不会按帧拆开。
 python -m act.prepare --dataset-root data/act_v1 --experiment output/act/exp_001 --val-fraction 0.2 --seed 42
 
 # 或明确列出要使用的 episode。没有列出的成功集不参与本次实验。
@@ -114,7 +116,7 @@ python -m act.prepare --dataset-root data/act_v1 --experiment output/act/exp_001
 ## 训练、恢复、停止
 
 ```bash
-# epochs=100 仅展示命令格式，不表示本任务已确定训练预算。
+# 训练上限示例：遍历训练集 100 轮。
 python -m act.train --dataset-root data/act_v1 --experiment output/act/exp_001 --config act/configs/baseline.yaml --epochs 100 --device cuda
 
 # 从最后一个已保存的完整 epoch 继续，到总计 150 个 epoch。
@@ -127,10 +129,20 @@ python -m act.train --dataset-root /root/autodl-tmp/act_v1 --experiment output/a
 中途被杀会重跑尚未保存的 epoch。相同软件/硬件上的 CPU 恢复可验证一致性，
 跨 GPU、驱动或平台不承诺逐位相同。新实验不允许覆盖已开始训练的目录。
 
-每个 epoch 后验证并记录：
+训练终端依次显示本轮训练与验证进度条：
+
+```text
+Train 01/100: ... train_loss=..., train_L1=..., val_loss=pending
+Valid 01/100: ... train_loss=..., val_loss=...
+```
+
+进度条显示 batch 完成比例、耗时和预计剩余时间。训练阶段的验证值为 `pending`；验证开始后保留本轮训练 loss，同时更新 `val_loss`，其含义为 `val_l1_z0`。训练总 loss 含 KL 项，不能与验证 loss 直接比较数值大小。
+
+`--progress auto` 默认在交互终端显示动态条，重定向日志时约每 10 秒在下一个 batch 完成后输出进展；`always` 强制动态条，`never` 保留阶段提示和每轮摘要。每轮结束打印中文误差摘要，完整指标写入 `metrics.jsonl`：
 
 | 指标 | 含义 |
 | --- | --- |
+| `train_loss` | 训练总损失：`train_l1 + kl_weight × train_kl` |
 | `train_l1` | 训练时使用后验 z 的动作误差，只统计有效动作元素 |
 | `train_kl` | CVAE 后验与标准正态先验的 KL |
 | `val_l1_z0` | 验证时不读取专家动作，用 z=0 预测的标准化动作误差，越低越好 |
@@ -142,7 +154,7 @@ python -m act.train --dataset-root /root/autodl-tmp/act_v1 --experiment output/a
 连续帧高度相关；验证只有少数 episode 时，结果波动不能当作稳定的泛化结论。
 
 停止有两种机制：显式 epoch 上限；或配置 `patience>0` 后，连续该数量的 epoch
-没有超过 `min_delta` 的验证改善时提前停止。默认 `patience=0`，不替用户决定耐心值。
+没有超过 `min_delta` 的验证改善时提前停止。默认 `patience=0`，即关闭早停。
 `best.pt` 总是跟踪最小 `val_l1_z0`，不受 `min_delta` 阈值影响。已经早停的实验
 不能通过恢复偷偷重置耐心值；更改停止策略应建立新实验。
 
@@ -168,60 +180,82 @@ output/act/exp_001/
 无需重新训练；checkpoint 已包含结构配置、schema、统计和完整权重。
 checkpoint 只加载自己或可信来源产生的文件，使用 PyTorch `weights_only=True`。
 
-## MuJoCo 闭环评估
+## 在 MuJoCo 中运行策略并生成视频
 
-```bash
-python -m act.rollout --checkpoint output/act/exp_001/best.pt --seeds 1000 1001 --output output/act/eval_001 --gui
-```
+离线验证比较模型动作与专家动作；仿真评估则让 checkpoint 根据新的观察持续控制机器人，检查能否完成捡球和投放。`rollout.py` 已包含策略执行和 MP4 导出，不需要额外录屏。
 
-加上 `--video` 会在评估目录保存各 seed 的俯视 MP4，包含最后 3 秒的静置判定，
-按控制频率 10 FPS 播放。云端无窗口评估可设置 `MUJOCO_GL=egl`，使用 `--device cuda --video`；
-俯视相机只用于回放，不输入策略网络。
+### 运行一个 seed
 
-AutoDL 的精简 Ubuntu 镜像可能缺少离屏渲染依赖。若出现 EGL 加载错误，可先安装
-`libegl1 libegl-mesa0 libgl1-mesa-dri`。若随后提示 Conda 的 `libstdc++.so.6`
-缺少 `GLIBCXX_3.4.30`，本项目在该镜像上验证过以下进程级设置：
+AutoDL / Linux 无窗口模式，在已安装 EGL 依赖的环境中运行：
 
 ```bash
 export MUJOCO_GL=egl
-export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6
+python -m act.rollout \
+  --checkpoint output/act/exp_001/best.pt \
+  --seeds 1000 \
+  --output output/act/eval_seed1000 \
+  --device cuda --max-steps 600 --video --label validation
 ```
 
-这两个环境变量用于云端 Linux；本地 Windows 不需要。GPU 训练和仿真渲染是两项
-独立能力，应先确认 `torch.cuda.is_available()`，再单独测试实际 MuJoCo 录像。
+本地使用 CPU 并打开窗口，可在 Windows PowerShell 执行：
 
-seed 只是命令示例，正式验证/测试名单仍由用户决定。默认 CPU 推理，每拍只执行一个
-0.1 秒区间，可选 `--device cuda`。MuJoCo 可以等待模型，因此仿真 10 Hz 不代表实际推理达到 10 Hz。
-报告包含最终环境成功率、仿真时间、控制拍数、推理延迟、请求与实际施加动作；
-每集正常结束后停底盘并继续仿真 3 秒，再判成功。模型不会获得物体真值。
-评估不调用 VISTA、不向采集 manifest 注册 episode、不把预测当作新的专家示范。
+```powershell
+python -m act.rollout --checkpoint output/act/exp_001/best.pt --seeds 1000 --output output/act/eval_seed1000_local --device cpu --gui --video
+```
 
-默认关闭时间集成。传 `--ensemble-coefficient 0.01` 后，对指向同一执行时刻的预测加权；
-沿用文档中旧到新 `exp(-m*i)` 的方向，正系数偏旧，需要单独评估切换延迟。
-动作反归一化后执行关节范围/目标速率限制、夹爪 0.4/0.6 滞回、底盘执行器限幅。
+把 checkpoint、seed 和输出目录换成自己的路径。输出目录必须尚不存在，重跑时使用新名称。批量场景可写 `--seeds 1000 1001 1002`；可用 `last.pt` 检查最后一轮，也可用 `best.pt` 检查离线验证误差最低的一轮。
 
-**当前仿真夹爪有一个明确限制。** VISTA 的 `close_gripper` 是一个 1.2 秒的有状态原语；
-同样的闭合目标可以连续触发两次原语，采集的五维动作却不能标识第二次调用的边界。
-ACT 适配器采用“开到闭的命令变化开启一次 1.2 秒判定，保持闭合不反复重置”的基线。
-它不会自动重试或在超时后延迟吸附；重新开启需要开再闭。因此不能宣称已经完全复现
-专家连续两次闭爪的隐藏状态。若失败集中于该处，应单独讨论统一底层抓取语义或增加可观测
-的重试信号，而不是仅增大模型。现有采集器和 VISTA 控制逻辑保持原样。
+### 输出与评分
 
-训练网络保留 `act.md` 的核心结构，包含教学设计的后验层数、相机/类型嵌入和有效元素
-损失归一化选择，不宣称与原论文的某个上游提交逐行相同。
+```text
+output/act/eval_seed1000/
+├── seed-1000.mp4
+├── seed-1000.json
+└── summary.json
+```
 
-参考：[ACT 原实现](https://github.com/tonyzhaozh/act)、
-[torchvision ResNet-18](https://docs.pytorch.org/vision/0.25/models/generated/torchvision.models.resnet18.html)、
-[PyTorch 安装版本](https://pytorch.org/get-started/previous-versions/)。
+| 文件 | 查看什么 |
+| --- | --- |
+| `seed-1000.mp4` | 10 FPS 俯视录像，观察接近、抓取、搬运和释放过程 |
+| `seed-1000.json` | 单场景结果、停止原因、请求动作与实际施加动作 |
+| `summary.json` | 各 seed 的结果、成功率、控制拍数、推理延迟、checkpoint 哈希和评估设置 |
 
-## 当前验证范围
+默认最多执行 600 拍，即 60 秒控制；检测到成功可提前结束。正常结束后停底盘并继续仿真 3 秒，再判最终成功，视频也包含该段。手动关闭窗口记为未成功。仿真会等待推理，因此 10 Hz 控制与 10 FPS 视频不代表实际计算达到实时速度。
 
-`tests/test_act.py` 使用临时合成 HDF5，覆盖执行拍样本对齐、补齐和损失屏蔽、场景隔离、
-训练集统计、Windows 来源路径迁移、文件哈希校验、CVAE 梯度、确定性 z=0 推理、
-epoch 恢复一致性、早停和 best/last 区分、独立 checkpoint 推理、同时间集成，以及
-两拍真实 MuJoCo 执行和收尾。另在 CPU 上用官方 ImageNet 权重验证了默认规模网络的
-单样本前向/反向。RTX 3080 Ti 上已验证默认完整模型的 8 次 FP32/AdamW 更新和
-z=0 推理：batch=8、K=32、单相机 240×320，PyTorch 峰值分配约 1.12 GiB、
-峰值保留约 1.34 GiB；这是合成输入短测，不能等同于所有配置的显存保证。
-同一云端环境的训练/恢复/独立策略/真实 MuJoCo 录像集成测试通过。AMP 尚未实测。
-正式实验指标与任务成功率以对应 `output/act/exp_*/` 的日志和评估摘要为准。
+策略只看车头图和实测状态，俯视图仅用于录像，物体真值仅用于评分。评估不会调用 VISTA，也不会将策略自己的动作导出为专家示范。GPU 训练和 MuJoCo 渲染需要分别检查；EGL 系统库安装见[项目环境配置](../README.md#环境配置)。
+
+`--label validation|test` 是报告标签，不会自动核查 seed 是否已用于训练。挑模型或调参数时使用固定验证场景，最终测试预留独立 seed；不要只凭一次成功视频或较低的动作误差判断泛化能力。
+
+### 时间集成超参数
+
+时间集成在**推理/评估命令**中设置，改变它不需要重新训练：
+
+```bash
+python -m act.rollout --checkpoint output/act/exp_001/best.pt --seeds 1000 --output output/act/eval_seed1000_m001 --device cuda --video --ensemble-coefficient 0.01
+```
+
+| 设置 | 执行方式 |
+| --- | --- |
+| 不传 `--ensemble-coefficient` | 关闭集成，每拍重新预测，执行最新动作块的第一拍 |
+| `--ensemble-coefficient 0` | 对覆盖同一执行时刻的候选动作等权平均 |
+| `--ensemble-coefficient 0.01` | 按旧到新顺序 `i=0,1,...` 使用 `exp(-m*i)` 权重，正系数偏向较旧预测 |
+
+集成组合的是不同预测块中指向同一时刻的动作，最多涉及 K 个块。它可能平滑动作，也可能延迟状态切换；比较时固定 checkpoint 和验证 seeds，并使用不同输出目录。
+
+### 动作适配约定
+
+预测反归一化后，由 `SimActionAdapter` 执行关节范围和目标变化速率限制、夹爪 0.4/0.6 滞回以及底盘执行器限幅。夹爪从开到闭的命令变化开启一次 1.2 秒抓取判定，持续闭合不重新计时；重新触发需要先开再闭。
+
+五维动作无法表示专家连续两次 `close_gripper` 的高层调用边界。因此，适配器与 VISTA 原语的重复抓取语义存在差异。分析抓取失败时，应同时检查预测动作、阈值转换和执行回执，不能仅用动作 L1 判断控制语义是否一致。
+
+## 测试与参考
+
+```bash
+python -m pytest tests/test_act.py -q
+```
+
+测试覆盖样本对齐、padding 与损失屏蔽、场景隔离、训练集统计、路径迁移、文件哈希、CVAE 梯度、z=0 推理、训练恢复、早停、时间集成及 MuJoCo 录像。合成数据测试用于检查实现行为，任务表现由独立场景评估。
+
+网络保留 ACT 的 CVAE、动作分块和 Transformer 结构，并采用本项目的后验层数、相机/类型嵌入和有效元素损失归一化约定。结构与数据契约以本项目源码为准。
+
+参考：[ACT 原实现](https://github.com/tonyzhaozh/act)、[torchvision ResNet-18](https://docs.pytorch.org/vision/0.25/models/generated/torchvision.models.resnet18.html)、[PyTorch 安装版本](https://pytorch.org/get-started/previous-versions/)。

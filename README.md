@@ -1,135 +1,195 @@
-# MuJoCo · VISTA
+# MuJoCo·VISTA·ACT
 
-让视觉模型通过车头相机控制移动机械臂，在 MuJoCo 中完成捡球、搬运和投放。采集器记录执行前图像与实测状态、随后施加的动作，完整成功集自动导出 ACT HDF5，并持续追加 manifest。VISTA 负责示范；`act/` 提供数据准备、训练、checkpoint 推理和仿真评估，实机接入尚未实现。当前真实采集数据的训练/验证划分与正式训练尚未执行。
+在 MuJoCo 中，让移动机械臂通过视觉完成捡球、搬运和投放，并将成功示范用于 ACT 模仿学习。
 
-## 当前结构
+项目连接三个部分：**MuJoCo** 提供机器人、物理仿真和数据记录；**VISTA** 用视觉模型、工具和记忆生成示范；**ACT** 从示范中学习连续控制策略，再回到同一仿真环境中评估。策略输入为车头 RGB 图像和五维机器人实测状态，输出为肩、肘、夹爪及底盘的控制目标。
 
 ```text
-brains/vista/       VISTA 决策、工具、图片与笔记管理
-act/                ACT 数据读取、网络、训练、推理与闭环评估（默认 K=32）
-control/           底盘、两自由度机械臂、夹爪控制
-sim/               MuJoCo 场景与机器人封装
-models/            当前使用的四个 XML 模型文件
-tests/             VISTA、控制与回放测试
-act.md             ACT 原理与早期教学设计；实际运行方式见 act/README.md
-assets/act/        ACT 设计配图
-run_collect.py     采集入口，默认 VISTA、1 个 episode
-hal.py             仿真硬件接口
-config.py          物理参数、相机、频率与路径
-recorder.py         原始记录、成功集 HDF5、manifest 与崩溃恢复
-playback.py         历史状态回放
-replay_gui.py       回放窗口与轨迹校验
-rerender.py         从轨迹重新生成录像
-inspect_data.py     采集数据检查
-compose_model.py    组合底盘与机械臂模型
-viz.py             相机与运行窗口
-_archive/          本地冻结归档，不参与运行、测试或 Git 提交
+MuJoCo 场景 → VISTA 示范 → 成功轨迹 HDF5 + manifest
+                                      ↓
+MuJoCo 策略评估 ← ACT checkpoint ← 数据划分与训练
 ```
 
-完整设计与工具协议见 [VISTA 说明](brains/vista/readme.md)。VISTA 仍使用 LangGraph 库；旧的 `brains/langgraph/` 策略实现已归档。
+## 项目布局
 
-## 运行
+```text
+MuJoCo_Brain/
+├── brains/
+│   └── vista/
+├── act/
+├── control/
+├── sim/
+├── models/
+├── tests/
+├── run_collect.py
+├── recorder.py
+├── playback.py
+├── replay_gui.py
+├── rerender.py
+├── inspect_data.py
+├── compose_model.py
+├── hal.py
+├── config.py
+├── viz.py
+├── requirements.txt
+├── .env.example
+├── data/                  # 运行时生成，Git 忽略
+└── output/                # 运行时生成，Git 忽略
+```
 
-使用 Python 3.12+，安装唯一一份依赖：
+| 路径 | 职责 |
+| --- | --- |
+| `brains/vista/` | 视觉决策、工具调用、图片档案与笔记；见下文 VISTA |
+| `act/` | 数据准备、网络、训练、策略推理与评估；见下文 ACT |
+| `control/` | 底盘、两自由度机械臂、夹爪的控制器与动作原语 |
+| `sim/` / `models/` | 仿真环境、机器人封装与 MuJoCo XML 模型 |
+| `hal.py` / `config.py` | 硬件抽象接口，以及物理参数、相机、频率和路径 |
+| `run_collect.py` / `recorder.py` | 采集循环、原始记录、成功集导出和中断恢复 |
+| `playback.py` / `replay_gui.py` | 历史状态回放、回放窗口与轨迹校验 |
+| `rerender.py` / `inspect_data.py` | 重渲染录像、查看元数据和决策记录 |
+| `compose_model.py` / `viz.py` | 模型组合与相机、运行窗口 |
+| `tests/` | 数据、控制、VISTA 协议及 ACT 训练推理测试 |
+| `data/` / `output/` | 采集数据，以及 VISTA 记忆、ACT 实验和评估产物 |
+
+以下命令均在项目根目录执行。数据、模型权重、运行产物和 `.env` 不随 Git 提交；换机器时按需单独传输。
+
+## 环境配置
+
+#### 本地环境
+
+使用 Python 3.12，建议创建独立虚拟环境。Windows PowerShell：
 
 ```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cpu
 python -m pip install -r requirements.txt
+python -m pip check
 ```
 
-首次配置可复制 `.env.example` 为 `.env`，填入支持**图片输入和工具调用**的 OpenAI 兼容端点、模型与密钥。保留已有 `.env`，不要覆盖其中的本机配置。VISTA 当前要求 `stream=false`，并且必须提供正整数 `max_model_calls`；进程环境变量优先于 `.env`。
+上述 CPU wheel 适合无 NVIDIA 显卡的电脑，用于采集、数据准备、调试和 CPU 推理。Linux 激活环境使用 `source .venv/bin/activate`。ACT 正式训练建议使用 CUDA GPU。
 
-当前电脑可直接使用已有 Windows 环境：
+#### AutoDL / Ubuntu GPU 环境
 
-```powershell
-.\.venv-gui\Scripts\python.exe run_collect.py --gui
+选择 Python 3.12 和兼容 NVIDIA 驱动的镜像，克隆项目后，在实例终端执行：
+
+```bash
+# 系统库：MuJoCo 无窗口渲染；tmux 用于保留断线后的终端会话。
+apt-get update
+apt-get install -y libegl1 libegl-mesa0 libgl1-mesa-dri tmux
+
+cd /root/autodl-tmp/MuJoCo_Brain
+python --version
+nvidia-smi
+python -m venv /root/autodl-tmp/act-env
+source /root/autodl-tmp/act-env/bin/activate
+
+# CUDA 12.8 wheel 示例，要求宿主机驱动兼容。
+python -m pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cu128
+python -m pip install -r requirements.txt
+python -m pip check
+python -c "import torch; assert torch.cuda.is_available(); print(torch.cuda.get_device_name(0))"
+
+# 后续在这个终端中运行 MuJoCo 离屏采集或策略录像。
+export MUJOCO_GL=egl
 ```
 
-Linux / WSL 可使用 `./run`；第一次运行会通过 `uv` 创建环境并安装依赖。已有环境若缺少 VISTA 依赖，请先安装 `requirements.txt`。
+`apt-get update` 更新系统软件包索引，`pip install` 安装虚拟环境里的 Python 包。EGL 库用于渲染，读取 HDF5 训练本身不需要图形窗口；标准平台的 `imageio-ffmpeg` wheel 自带录像所需的 FFmpeg。其他 CUDA 组合见 [PyTorch 版本表](https://pytorch.org/get-started/previous-versions/)。
 
-常用参数：
+`act-env` 是 `python -m venv` 创建的环境目录，名称可以自定，新终端要重新激活。需要断线后继续训练时，可先 `tmux new -s act`，再激活环境并运行训练；按 `Ctrl+B`、松开后按 `D` 离开会话，使用 `tmux attach -t act` 返回。tmux 不负责关闭计费实例。数据迁移和训练命令见 [ACT 使用说明](act/README.md)。
 
-- `--episodes 1`：采集集数，默认 1。
-- `--max-decisions 64`：外层决策轮数上限；每轮内部的模型请求上限由 `max_model_calls` 单独控制。
-- `--seed 0`：初始场景随机种子，后续 episode 逐次递增。
-- `--keep-open`：配合 `--gui`，结束后保留窗口。
-- `--no-images`：关闭通用采集图像；VISTA 仍保存必需的车头 PNG。
-- `--out <目录>`：通用采集记录目录，默认 `data/episodes/`。
-- `--brain-memory <目录>`：VISTA 图片、笔记和调用日志目录，默认 `output/vista/`。
-- `--dataset-out <目录>`：HDF5 和单个 `manifest.json` 的根目录，默认 `data/act_v1/`；多次运行追加，不重置。采集阶段不划分训练集/验证集。
+## MuJoCo
 
-原来的 `--brain=vista` 仍可使用，其余 brain 选项已移除。
+#### 场景与控制
 
-## 闭环与结果
+机器人由移动底盘、两自由度机械臂和夹爪组成，任务是将球放入收纳箱。车头相机提供 **320×240 RGB**，控制频率为 **10 Hz**。五维状态依次是肩角、肘角、夹爪连续开度、车体前向速度和转向角速度；动作对应关节目标、夹爪开闭目标和底盘目标速度。
 
-VISTA 用 `play` 交出一批动作；采集器按顺序执行后，将批次回执、最终车头图和同一时刻的五维实测状态交回模型。状态包括肩角、肘角、夹爪连续开度、车体前向速度和左转角速度。上一批结束后的观测直接作为下一批的执行前观测，不重复采样。模型可以查旧图及其状态、检查局部、读像素、维护笔记，最后调用 `finish`。动作执行进度不确定或关键记录失败时，程序停止，避免重复执行。
+VISTA 与 ACT 共用环境及底层执行接口。策略看图和本体状态，物体真值用于环境评分。俯视相机用于观察与录像，不输入策略。正常结束后停止底盘并继续仿真 3 秒，再判断最终任务结果。
 
-肩、肘实测角可见，支持 `arm_pose` 四种预设及 `shoulder` / `elbow` 单关节微调。微调参数 `delta` 是相对当前实测角的增量（rad），范围为 ±0.5；整批动作仍须通过参数校验后执行。
+#### 数据采集与格式
 
-`close_gripper` 固定执行 **1.2 秒（12 个控制拍）**，停止底盘、保持臂目标，一次连续完成闭合与稳定夹持判定；不提前返回、不自动延长。判定仍要求同一球连续 0.1 秒接触两侧指垫内面，开度在 0.05–0.45 且波动不超过 0.02。成功回执表示结束时仍确认夹持，抬臂后仍须直接看图验球；未确认则返回 `GRASP_NOT_CONFIRMED`。抓取时在同一 `play` 连续提交两次闭爪：第一次未确认仅允许紧邻第二次继续，第二次仍未确认则停止同批后续动作并交回新观察。两次均逐拍记录，共 2.4 秒、24 拍。首条失败、次条成功时保留首条 `failed` 和批次 `partial`，以第二条结果判断当前夹持。结束或异常均关闭新抓取判定，后续 observe/抬臂不会延迟吸附；已确认夹持仍会持续监测接触丢失。开爪仍为 0.8 秒。所有闭爪控制拍照常记录，ACT 动作字段仍是相同的五维目标。
-
-四个预设在 `config.py` 标定，角度为 `[肩, 肘]`（rad）：`stow=[0.00, 2.20]` 空爪看路，`reach=[1.1414, 1.4639]` 地面抓取，`carry=[0.95, 1.10]` 抬高验球及运输，`drop=[0.5161, 2.0053]` 短臂靠箱投放。TCP 前伸量相对底盘中心、离地高度分别为 reach 约 0.545/0.094 m、carry 约 0.67/0.31 m、drop 约 0.42/0.30 m；TCP 不是球心。抓取参考保持不变：320×240 原图、stow 视野中，地面球心约 `(160,110)`、直径约 `44px`，近似范围 x=156–164、y=107–112、直径 43–45px。三者相符且球停稳即可 reach；该参考不保证抓取，抬臂后仍须看图直接验球。
-
-投放使用普通 `forward(seconds)`：carry 持球并朝向箱口内部 → 切短 drop 后继续前进接近箱壁 → 停稳并核对持球与落球位置 → 另批开爪并 observe。drop 相比 carry 收回约 25 cm，需重新估计剩余距离；已确认持球、方向和前路时可同批执行 drop 与 forward。按 0.30 m/s 与执行时长估算距离，仍有明显距离时可用 0.8–1.2 秒前进；最后几厘米才用 0.1–0.2 秒微调，也可按估算距离在同一 play 连续执行多次短步，批末再看图。目标是车头实际接近箱壁；允许轻靠箱壁或箱角，不要求严格居中。不能只凭画面重叠提前开爪，也不持续顶推已靠住的箱壁。控制层执行普通动作，不提供箱壁接触、朝向或居中判定；任务成功由环境独立评估。
-
-模型图、inspect、原始 PNG 和 ACT 图像均保持原图，不叠加落球参考。短 drop 缩短前伸，球顶可能部分出画，仍须看清球与夹爪关系。`tests/test_arm_presets.py` 覆盖 seed 1、2 各五种抓取偏差下的夹持、可见性、越沿余量、普通短步前进至箱壁和释放；控制与协议回归见 `tests/test_control_pure.py` 和 `tests/test_vista.py`。离线夹持样本不代表模型自主成功率。
-
-`observe` 停止底盘后固定推进 0.8 秒（8 个控制拍），保持臂和夹爪目标，逐拍记录到 ACT 数据。它只在结束后给模型新图，需比较等待前后的位置判断球是否仍在移动；不会自动重开抓取判定。模型思考和 `inspect` 不推进仿真时间。
-
-正常结束后继续仿真并采集 3 秒，再进行环境判定。模型自评与环境成功标志分别保存。`data/episodes/` 保存通用轨迹和录像图片，`output/vista/` 保存图片证据、消息、调用日志、每集草稿及跨集指南；下次运行时会自动创建这些目录。VISTA 的 `frame_index.jsonl` 为每张原图保存采样时间 `timestamp_s` 和实测状态 `observation`。`actions.jsonl` 在批次结算时追加一条记录，`observation` 只存该批执行前的五维实测状态，与 `before_frame_id` 对应；保留前后帧编号，不展开第二组执行后状态。`history` 查询已结算批次；`inspect` 按 `frame_id` 查询已归档图片，因此当前图即使没有对应的动作记录也可查看。
-
-## 采集、HDF5 与 manifest
-
-新控制录像直接渲染 320×240 RGB 并保存无损 PNG（车头与辅助俯视图均使用此尺寸）。每拍在物理推进前采样，再执行 0.1 秒，成功执行完这一拍才追加并刷盘 `trajectory.jsonl`。每行 `state` 是实测肩、肘、连续夹爪开度、前向速度、转向速度；`action` 是肩肘目标、二值夹爪目标、限幅后的底盘目标速度。原始 `t/t_end` 仅用于检查执行区间，`qpos/qvel/ctrl` 留作仿真诊断。最终观测单独保存在 `terminal.json`，回放会读取它，训练不会给它伪造动作。
-
-一集正常结束且最终环境判定成功，即整集入选；保留全部控制拍，包括静止、纠错和收尾等待，不做行为质量打分或片段裁剪。仍会检查图片可读、形状正确、数值有限和控制拍连续，防止损坏的数据被当成训练数据。失败或中断仅排除出训练候选集，原始记录不删除；`--no-images` 是诊断模式，即使任务成功也不导出 HDF5。
-
-普通任务失败（包括模型主动结束但环境未成功、耗尽 `--max-decisions`）不会终止多集采集；结算失败集后继续下一个 seed。已知的机械臂到位超时、卡住或闭爪未确认稳定夹持会返回 `failed, action_applied=true`：停止当前批次的剩余动作，接回新观察，让 VISTA 继续决策；仅连续两次闭爪中的第一次未确认允许第二次继续。全部请求的集数完成后，只要有失败，命令最终返回退出码 1，这不表示在首个失败处提前停止。模型请求异常、文件写入异常、控制器执行进度未知等运行错误仍会停止；关闭 GUI 也会提前结束。
-
-每个入选 episode 在 `--dataset-out` 下得到一个 `episodes/episode-0000.h5`，含三个数组：
+采集入口为 `run_collect.py`，配置和启动命令见下一节。每个控制拍先采样图像与实测状态，再执行 0.1 秒动作；完整执行后写入原始轨迹。一集正常结束且环境判定成功后，整集导出 HDF5，包括纠错、等待和收尾控制拍。
 
 ```text
-/observations/images/front  uint8   [T, 240, 320, 3]
-/observations/state         float32 [T, 5]
-/action                     float32 [T, 5]
+data/
+├── episodes/
+│   └── ep_0000/            # 原始轨迹、图片、决策及结束观测
+└── act_v1/
+    ├── manifest.json
+    └── episodes/
+        └── episode-0000.h5
 ```
 
-图像像素直接打包在 HDF5 中，使用无损分块压缩；没有 `/timestamp`、`/source_step`，状态和动作保留物理单位、不提前归一化。`T = action.shape[0]`，也写入文件属性和 manifest 的 `num_steps`。这是本项目面向 ACT 的格式，不是原版 ACT loader 的直接替代。以后 Dataset 负责通道转换、归一化和未来动作块抽取。
+| HDF5 字段 | 类型与形状 | 含义 |
+| --- | --- | --- |
+| `/observations/images/front` | `uint8 [T,240,320,3]` | 执行前的 RGB 像素 |
+| `/observations/state` | `float32 [T,5]` | 同一时刻的实测状态 |
+| `/action` | `float32 [T,5]` | 随后施加的控制目标 |
 
-每个数据集目录只有一个 manifest，顶层为 `schema` 和 `episodes`。每个 episode 记录独立身份、源目录、seed、状态、是否入选、HDF5 路径、T 和原因。原始目录/VISTA 目录的局部编号无需相同，manifest 保存原始路径，原始 meta 保存 VISTA 路径；不同采集目录中的同名 `ep_0000` 不会覆盖同一个 HDF5。`selected_for_dataset=true` 表示合格候选；**现在不保存 train/val 归属、不自动划分**，准备训练时冻结清单并按 episode/场景分组划分。
+状态和动作保留物理单位，归一化在 ACT 数据准备与读取阶段完成。`manifest.json` 保存 schema、episode 身份、seed、来源、状态、相对 HDF5 路径及控制拍数。采集阶段只判断是否为合格示范，训练/验证划分由 `act.prepare` 完成。
 
-```powershell
-.\.venv-gui\Scripts\python.exe run_collect.py --gui --episodes 5 --seed 0 --out data/episodes/run_001 --brain-memory output/vista/run_001 --dataset-out data/act_v1
+同一个 `--dataset-out` 持续追加数据。失败和中断集保留原始记录，但不进入训练候选；`--no-images` 用于诊断，不导出 HDF5。原始记录逐拍刷盘，HDF5 和 manifest 原子发布。下次采集自动检查未结算记录，也可运行 `python recorder.py --dataset-out data/act_v1` 恢复发布已有的完整成功集；不完整的 episode 标记为中断。
+
+#### 回放与检查
+
+```bash
+# 回放专家轨迹；--check 只校验、不打开窗口。
+python replay_gui.py data/episodes/ep_0000
+python replay_gui.py data/episodes/ep_0000 --check
+
+# 查看元数据；从历史物理状态重新渲染俯视录像。
+python inspect_data.py --meta ep_0000
+python rerender.py ep_0000 --cams overhead
+
+python -m pytest -q
 ```
 
-再次使用相同 `--dataset-out` 会继续追加清单和 HDF5 编号；指定新目录才是新数据集。默认 seed 每次从 0 开始，若要新场景，后续命令应显式改变 `--seed`。原始目录预留和 manifest 更新采用本地文件锁，避免多个进程覆盖或丢失条目；并发 VISTA 任务建议使用各自的 `--brain-memory`，避免共享并改写同一份 guide。
+协议测试使用模拟模型，不调用付费 API；仿真测试及重渲染需要可用的 MuJoCo 图形后端。历史轨迹回放重现保存的状态，ACT 策略评估则让 checkpoint 在环境中重新执行任务。
 
-## 中断与恢复
+## VISTA
 
-在首次动作前，先在 manifest 登记 `status=recording, selected_for_dataset=false, h5=null`。原始 JSONL 每拍追加并 flush/fsync；每集结束才读改写 manifest，使用临时文件、fsync、原子替换，保持旧条目。成功 HDF5 也先写临时文件，完整关闭并发布后才将 manifest 改成 `ready` 和入选。
+#### 视觉决策与记忆
 
-强制杀进程、崩溃或断电时，不会保证调用 Python 收尾代码。半集从开始就处于排除状态，不能依靠 finally 才排除。下次采集自动检查尚未结算的条目：正在运行的源目录仍有进程锁，因此跳过；已停止且没有完整结果的标为 `interrupted`；已经写下完整成功结果、只差导出/更新清单的则恢复发布，不重复创建条目。可单独恢复，不调用模型：
+VISTA 将视觉模型的工具调用组织成一个 LangGraph 循环。模型可以查看原图或局部、读取像素、查询动作历史、维护跨集指南和本集草稿，再用 `play` 提交动作批次。采集器执行后返回新观测和回执；模型继续检查结果，直至调用 `finish` 或达到决策上限。
 
-```powershell
-.\.venv-gui\Scripts\python.exe recorder.py --dataset-out data/act_v1
+#### 配置与运行
+
+首次配置时，将 `.env.example` 复制为 `.env`，填写支持**图片输入和工具调用**的 OpenAI 兼容 Chat Completions 端点、模型和密钥。设置 `stream=false` 和正整数 `max_model_calls`；进程环境变量优先于 `.env`。仅使用 ACT 训练或推理不需要这些 API 配置。
+
+```bash
+python run_collect.py --brain vista --gui --episodes 5 --seed 0 --max-decisions 64 --out data/episodes/run_001 --brain-memory output/vista/run_001 --dataset-out data/act_v1
 ```
 
-此前完成的成功集不受后一集崩溃影响；半集保留已完成且刷盘的控制拍，正在执行或尚未刷完的一拍不保证完整，整个半集不会导出为训练数据。断电后的存储介质可靠性仍取决于操作系统与磁盘，不能承诺零字节丢失。
+云端无窗口采集去掉 `--gui`，并使用前述 EGL 配置。`--seed` 为首集场景，后续逐次递增；再次采集新场景时相应调整起始 seed。`--max-decisions` 限制每集外层决策次数，`max_model_calls` 限制每次决策内部的模型请求次数。
 
-当前已实现采集与回放闭环；真实模型的视觉判断、抓球稳定性和成功率仍需单独验证。
+文件布局、LangGraph 状态与图、九个工具及控制约定见 [VISTA README](brains/vista/README.md)。
 
-## 验证
+## ACT
 
-ACT 的样本/epoch 概念、数据准备、AutoDL 路径迁移、训练和恢复命令见 [act/README.md](act/README.md)。准备程序要求显式指定划分方案，读取采集快照并写入新的实验目录，不修改正在采集的 manifest。训练依赖已合并进 `requirements.txt`；按机器选择匹配的 PyTorch CPU/CUDA wheel。
+#### 数据准备与训练
 
-```powershell
-.\.venv-gui\Scripts\python.exe -m pytest -q
-.\.venv-gui\Scripts\python.exe replay_gui.py <episode目录或trajectory.jsonl> --check
+ACT 使用 ImageNet 预训练 ResNet-18 提取视觉特征，通过 CVAE 和 Transformer 预测未来动作块。默认 **K=32、batch size=8、单车头相机、五维状态与动作**。一个样本对应一个控制时刻；一个 episode 可以提供多个样本。
+
+```bash
+# 选择一个尚不存在的实验目录；按场景 seed 分组划分训练/验证集。
+python -m act.prepare --dataset-root data/act_v1 --experiment output/act/exp_001 --val-fraction 0.2 --seed 42
+
+# epochs 表示遍历训练集的总轮数，可按训练预算调整。
+python -m act.train --dataset-root data/act_v1 --experiment output/act/exp_001 --config act/configs/baseline.yaml --epochs 100 --device cuda
 ```
 
-测试使用模拟模型，不调用付费 API；其中仿真测试需要可用的 MuJoCo DLL 和图形环境。`pytest.ini` 将默认测试范围限定在 `tests/`，不会收集归档中的旧测试。
+`prepare` 冻结数据清单、划分和训练集统计；`train` 显示每轮训练/验证进度与 loss，保存指标和 `best.pt` / `last.pt`。`exp_001` 是一次实验的目录，可以包含多个 checkpoint；推理直接加载 checkpoint，无需重新训练。
 
-## 历史归档
+上传云端时保留数据目录中的 `manifest.json` 和 `episodes/*.h5` 相对结构。若已在本地执行 `prepare`，同时上传对应实验目录，再通过 `--dataset-root` 指向云端数据位置。来源记录中的本地绝对路径不参与训练读取。
 
-2026-10-13 之前的旧 brain、运行结果、日志、研究资料、旧测试和压缩包已集中放入 `_archive/20261013-pre-vista/`。其中 `files/` 保持原相对路径，`before-cleanup/` 保存本次修改前的文件，`manifest.json` 记录移动清单。归档用于需要时找回资料，不作为当前代码的一部分。
+#### 策略评估与视频
 
-临时的 64 轮实验启动脚本已放入 `_archive/20261014-vista-baseline/files/`；继续使用 `run_collect.py` 和 `--max-decisions` 参数运行实验。
+云端设置 `MUJOCO_GL=egl` 后，指定 checkpoint 和场景 seed 即可生成新策略执行的视频：
+
+```bash
+python -m act.rollout --checkpoint output/act/exp_001/best.pt --seeds 1000 --output output/act/eval_seed1000 --device cuda --video --label validation
+```
+
+输出目录须为新目录，包含 `seed-1000.mp4`、动作轨迹 JSON 和 `summary.json`。离线验证动作误差用于观察拟合情况；MuJoCo 成功率和视频用于检查实际行为。用于选模型或调参数的 seed 属于验证，最终测试应预留独立 seed。
+
+数据契约、模型设置、恢复训练、时间集成及评估说明见 [ACT README](act/README.md)；逐模块实现逻辑见 [ACT 模块详解](act/README_log.md)。

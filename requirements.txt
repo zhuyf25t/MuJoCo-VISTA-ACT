@@ -1,5 +1,7 @@
 # Python 3.12+; validated baseline: Python 3.12.
 # Install: python -m pip install -r requirements.txt
+# AutoDL: install matching CUDA torch/torchvision wheels first; see README.md.
+# apt packages (EGL/Mesa for headless video, optional tmux) are not pip dependencies.
 # Direct dependencies pinned for reproducible installation.
 # WSL GUI also needs WSL 2/WSLg and system OpenGL libraries.
 
@@ -16,6 +18,7 @@ langgraph==1.2.12
 langchain-core==1.6.5
 
 # PNG observations, HDF5 datasets and MP4 replay (FFmpeg is a runtime plugin).
+# imageio-ffmpeg wheels bundle the FFmpeg binary on common Linux/Windows platforms.
 Pillow==12.3.0
 h5py==3.16.0
 imageio==2.37.4
@@ -26,6 +29,7 @@ imageio-ffmpeg==0.6.0
 torch==2.10.0
 torchvision==0.25.0
 PyYAML==6.0.3
+tqdm==4.67.1
 
 # Existing control, simulation and mocked LLM tests.
 pytest==9.1.1
