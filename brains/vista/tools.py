@@ -13,7 +13,7 @@ import config
 from .model import image_message
 from .settings import VistaSettings
 from .state import validate_reply
-from .storage import HistoryQueryError, VistaStorage
+from .storage import GuideConflict, HistoryQueryError, VistaStorage
 
 
 class _Arguments(ValueError):
@@ -181,9 +181,12 @@ def tool_schemas(settings: VistaSettings, actions: dict) -> list[dict]:
                   "step": {**_integer("仅frame可设大于1的步长；从start开始等差抽样", 1), "default": 1},
                   "limit": {**_integer("最多返回的批次或抽样帧条数，不是动作数", 1, settings.history_max_limit),
                             "default": settings.history_default_limit}})),
-        ("read_guide", "读取稳定指南。" + guide_scope, _object({})),
-        ("write_guide", "完整替换指南，不是追加；保留需要的旧内容。" + guide_scope,
-         _object({"content": _text("完整新版指南", settings.max_guide_chars)}, ("content",))),
+        ("read_guide", "读取共享指南及其revision版本；其他进程也会更新。" + guide_scope, _object({})),
+        ("write_guide", "完整替换共享指南；base_revision须为你已读版本，保留需要的旧经验。"
+         "发生GUIDE_CONFLICT时本次没有写入；先read_guide重读，由你合并新旧经验后再提交，不能原样覆盖他人更新。" + guide_scope,
+         _object({"content": _text("合并后完整新版指南", settings.max_guide_chars),
+                  "base_revision": _text("从初始指南或read_guide返回值复制的revision", 64)},
+                 ("content", "base_revision"))),
         ("read_working", "读取当前计划、假设、预期和未决问题。" + working_scope, _object({})),
         ("write_working", "完整替换本次实验草稿，不会修改历史事实。" + working_scope,
          _object({"content": _text("完整新版草稿", settings.max_working_chars)}, ("content",))),
@@ -274,7 +277,14 @@ class VistaTools:
             if name in ("read_guide", "read_working"):
                 return success(self.storage.read_memory(name.removeprefix("read_"))), []
             if name in ("write_guide", "write_working"):
-                return success(self.storage.write_memory(name.removeprefix("write_"), args["content"])), []
+                try:
+                    return success(self.storage.write_memory(name.removeprefix("write_"), args["content"],
+                                   base_revision=args.get("base_revision"))), []
+                except GuideConflict as error:
+                    result = failure("GUIDE_CONFLICT", str(error),
+                                     "先read_guide获取完整最新版，合并保留他人经验，再用新base_revision提交")
+                    result["data"] = {"current_revision": error.latest["revision"], "written": False}
+                    return result, []
             if name == "history":
                 mode = args.get("mode", "batch")
                 if args.get("start", 0) > args.get("end", math.inf):

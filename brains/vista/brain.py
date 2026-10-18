@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
+import time
 from copy import deepcopy
 from pathlib import Path
 
-from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.graph.message import add_messages
 from observations import FrameObservation, ObservationWindow
 
@@ -45,13 +46,14 @@ class VistaBrain(Brain):
         self._closed = False
         self.decision_round = 0
 
-    def begin_episode(self, ep_dir, task_text, tool_schemas):
+    def begin_episode(self, ep_dir, task_text, tool_schemas, *, episode_name=None):
         if self._active or self._closed:
             raise RuntimeError("VISTA 必须结束上一 episode，且不能复用已关闭的 brain")
         if not isinstance(task_text, str) or not task_text.strip():
             raise RuntimeError("VISTA 任务描述不能为空")
         self.tools = VistaTools(self.storage, self.settings, tool_schemas)
-        self.storage.begin_episode(Path(ep_dir), task_text)
+        self.storage.begin_episode(Path(ep_dir), task_text, episode_name=episode_name)
+        self._guide_revision = None
         self.state = {"messages": [], "model_calls": 0}
         self.task_text = task_text
         self._control_schemas = deepcopy(tool_schemas)
@@ -75,13 +77,25 @@ class VistaBrain(Brain):
             raise RuntimeError(f"本轮模型调用已达到 max_model_calls={self.max_model_calls}，程序终止。")
         self.storage.event("model_request", decision_round=self.decision_round, model_call=attempt)
         try:
-            reply = self.model.invoke(state["messages"], tools=self.tools.schemas, system=self.system_prompt)
+            guide = self.storage.read_memory("guide", reader="before_model")
+            updates = []
+            if guide["revision"] != self._guide_revision:
+                notice = HumanMessage(content="共享guide已更新；以下是当前完整版本，后续写入以此revision为依据：\n"
+                                      + json.dumps(guide, ensure_ascii=False))
+                self.storage.log_message(notice)
+                updates.append(notice)
+                self._guide_revision = guide["revision"]
+            messages = add_messages(state["messages"], updates)
+            request_started = time.monotonic()
+            reply = self.model.invoke(messages, tools=self.tools.schemas, system=self.system_prompt)
+            self.storage.event("model_response", decision_round=self.decision_round, model_call=attempt,
+                               elapsed_seconds=time.monotonic() - request_started)
             validate_reply(reply)
             self.storage.log_message(reply)
         except Exception as error:
             self.storage.diagnostic("model_error", error, decision_round=self.decision_round, model_call=attempt)
             raise
-        return {"messages": [reply], "model_calls": attempt}
+        return {"messages": [*updates, reply], "model_calls": attempt}
 
     def decide(self, obs: FrameObservation, task_text, tool_schemas, history) -> list[Decision]:
         self._require_active()
@@ -100,6 +114,7 @@ class VistaBrain(Brain):
                 context = {"task": task_text, "initial_frame_id": info["frame_id"],
                            "guide": self.storage.read_memory("guide"),
                            "working": self.storage.read_memory("working")}
+                self._guide_revision = context["guide"]["revision"]
                 message = image_message([(info, self.storage.load_image(info["frame_id"]))],
                                         "本次任务、初始观察和初始笔记：\n" + json.dumps(context, ensure_ascii=False))
                 self._append([message])

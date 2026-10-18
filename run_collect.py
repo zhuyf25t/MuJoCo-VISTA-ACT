@@ -7,11 +7,16 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
+import multiprocessing
 import os
+import signal
 import sys
 import time
-from contextlib import ExitStack
+import traceback
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
+from pathlib import Path
 
 os.environ.setdefault("MUJOCO_GL", "glfw" if sys.platform == "win32" or "--gui" in sys.argv
                       else "egl")  # 必须在导入仿真模块之前设置。
@@ -20,7 +25,7 @@ import config  # noqa: E402
 from brains.vista.base import Decision  # noqa: E402
 from control.drivers import ActionFailed, GraspNotConfirmed  # noqa: E402
 from control.tools import ToolLayer  # noqa: E402
-from recorder import DatasetStore, EpisodeRecorder, next_episode_dir  # noqa: E402
+from recorder import DatasetStore, EpisodeRecorder, _atomic_json  # noqa: E402
 from sim.env import MobileManipEnv, parse_task  # noqa: E402
 from viz import CameraRig, GuiViewer  # noqa: E402
 
@@ -183,7 +188,8 @@ def _settle_episode(env, outcome, on_tick, gui=None, verbose=True):
 
 def run_episode(env, brain, tool_schemas, task_text, ep_dir, gui=None,
                 save_images: bool = True, verbose: bool = True,
-                seed: int | None = None, dataset: DatasetStore | None = None) -> dict:
+                seed: int | None = None, dataset: DatasetStore | None = None,
+                episode_name: str | None = None) -> dict:
     # LIFO 释放：记录文件 → 录像相机；环境相机由 env.close() 释放。
     with ExitStack() as resources:
         width, height = config.CAM_FRONT_RES
@@ -231,7 +237,8 @@ def run_episode(env, brain, tool_schemas, task_text, ep_dir, gui=None,
         outcome = {"success": False, "brain_success": None, "decisions": 0,
                    "decision_rounds": 0, "reason": "决策轮数耗尽", "stop_code": "decision_limit"}
         try:
-            brain.begin_episode(ep_dir, task_text, tool_schemas)
+            brain.begin_episode(ep_dir, task_text, tool_schemas,
+                                **({"episode_name": episode_name} if episode_name is not None else {}))
             env.start_observation_stream()
             try:
                 _run_vista_rounds(env, brain, tools, recorder, task_text, tool_schemas,
@@ -290,12 +297,117 @@ def run_episode(env, brain, tool_schemas, task_text, ep_dir, gui=None,
         return outcome
 
 
+def episode_path(root, seed):
+    """Names are determined by scene seed, never by completion order."""
+    return Path(root).resolve() / f"ep_{seed:04d}"
+
+
+def check_episode_paths(args):
+    memory = args.brain_memory or config.ROOT / "output" / "vista"
+    for seed in range(args.seed, args.seed + args.episodes):
+        for root in (args.out, memory):
+            path = episode_path(root, seed)
+            if path.exists():
+                raise RuntimeError(f"seed={seed} 对应目录已存在：{path}；请换起始seed或输出根目录，不覆盖旧记录。")
+
+
+def _collect_worker(args, seed, ep_dir):
+    """Spawned process owns its renderer, physics, model client and episode files."""
+    signal.signal(signal.SIGINT, signal.SIG_IGN)  # Parent handles graceful drain.
+    started = time.monotonic()
+    result_path = ep_dir / "worker_result.json"
+    with (ep_dir / "collector.log").open("w", encoding="utf-8", buffering=1) as log:
+        with redirect_stdout(log), redirect_stderr(log):
+            try:
+                dataset = DatasetStore(args.dataset_out)
+                task = parse_task(args.task)
+                with ExitStack() as resources:
+                    env = resources.enter_context(MobileManipEnv())
+                    brain = build_brain(args.brain_memory)
+                    resources.callback(brain.close)
+                    if args.max_decisions is not None:
+                        brain.max_decisions = args.max_decisions
+                    schemas = ToolLayer(env.robot.base, env.robot.arm, env.robot.hal).schemas_anthropic()
+                    env.reset(seed=seed, task=task)
+                    result = run_episode(env, brain, schemas, args.task or task.text(), ep_dir,
+                                         save_images=not args.no_images, verbose=not args.quiet,
+                                         seed=seed, dataset=dataset, episode_name=ep_dir.name)
+            except BaseException as error:
+                traceback.print_exc()
+                result = {"success": False, "reason": str(error), "stop_code": "worker_error",
+                          "error_type": type(error).__name__, "decision_rounds": 0, "decisions": 0}
+            result.update(seed=seed, wall_seconds=time.monotonic() - started, pid=os.getpid())
+            _atomic_json(result_path, result)
+
+
+def run_parallel(args, dataset):
+    context = multiprocessing.get_context("spawn")
+    pending = iter(range(args.seed, args.seed + args.episodes))
+    active, results = {}, []
+    exhausted = stopping = False
+    started = time.monotonic()
+    def request_stop(signum, frame):
+        nonlocal stopping
+        if stopping:
+            raise KeyboardInterrupt
+        stopping = True
+        print("停止派发新episode；等待当前episode完成并保存。再次Ctrl+C立即中断。", flush=True)
+    previous = signal.signal(signal.SIGINT, request_stop)
+    try:
+        while active or not exhausted and not stopping:
+            if args.stop_file and Path(args.stop_file).exists() and not stopping:
+                request_stop(None, None)
+            while not exhausted and not stopping and len(active) < args.workers:
+                seed = next(pending, None)
+                if seed is None:
+                    exhausted = True
+                    break
+                ep_dir = episode_path(args.out, seed)
+                ep_dir.parent.mkdir(parents=True, exist_ok=True)
+                ep_dir.mkdir(exist_ok=False)
+                process = context.Process(target=_collect_worker, args=(args, seed, ep_dir),
+                                          name=f"vista-seed-{seed}")
+                process.start()
+                active[seed] = (process, ep_dir)
+                print(f"[启动] seed={seed} -> {ep_dir.name}, pid={process.pid}", flush=True)
+            for seed, (process, ep_dir) in list(active.items()):
+                if process.is_alive():
+                    continue
+                process.join()
+                path = ep_dir / "worker_result.json"
+                result = (json.loads(path.read_text(encoding="utf-8")) if path.exists() else
+                          {"seed": seed, "success": False, "stop_code": "worker_crash",
+                           "reason": f"worker退出码{process.exitcode}，未写完成结果"})
+                results.append(result)
+                print(f"[完成] seed={seed} {'PASS' if result['success'] else 'FAIL'} "
+                      f"({result.get('decision_rounds', 0)}轮, {result.get('wall_seconds', 0):.1f}s)", flush=True)
+                process.close()
+                del active[seed]
+            if active:
+                time.sleep(0.1)
+    finally:
+        signal.signal(signal.SIGINT, previous)
+        for process, _ in active.values():
+            if process.is_alive():
+                process.terminate()
+            process.join()
+            process.close()
+        dataset.recover()
+    elapsed = time.monotonic() - started
+    success = sum(bool(r["success"]) for r in results)
+    print(f"===== 汇总: {success}/{len(results)}成功；总耗时{elapsed:.1f}s；"
+          f"完成吞吐{len(results)*3600/max(elapsed, .001):.2f}集/小时 =====", flush=True)
+    return 0 if len(results) == args.episodes and success == args.episodes else 1
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="MuJoCo VISTA 数据采集")
     ap.add_argument("--brain", default="vista", choices=["vista"], help="当前仅保留 VISTA")
     ap.add_argument("--brain-memory", help="VISTA 图片、笔记与调用记录根目录，默认 output/vista")
     ap.add_argument("--max-decisions", type=int, help="最大外层决策轮数")
     ap.add_argument("--episodes", type=int, default=1)
+    ap.add_argument("--workers", type=int, default=1, help="并行episode进程数；大于1时使用无GUI采集")
+    ap.add_argument("--stop-file", help="该文件出现后停止派发新episode，当前episode完整结束")
     ap.add_argument("--task", default=None, help="任务文本，默认把一个网球放进收纳箱")
     ap.add_argument("--gui", action="store_true", help="打开 MuJoCo 交互窗口")
     ap.add_argument("--keep-open", action="store_true", help="采集结束后保持最后画面，关闭窗口退出")
@@ -303,11 +415,15 @@ def main(argv=None) -> int:
     ap.add_argument("--out", default=str(config.EPISODES_DIR))
     ap.add_argument("--dataset-out", default=str(config.ACT_DATA_DIR),
                     help="HDF5 和 manifest 根目录；多次运行始终追加，不重置")
-    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--seed", type=int, default=0, help="起始seed；seed i固定保存到ep_i，已有目录不覆盖")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args(argv)
     if args.episodes < 1:
         ap.error("--episodes 必须至少为 1")
+    if args.workers < 1 or args.seed < 0:
+        ap.error("--workers 必须至少为1，--seed必须非负")
+    if args.workers > 1 and args.gui:
+        ap.error("--workers > 1 时请去掉 --gui；各进程仍独立渲染采集图像")
     if args.keep_open and not args.gui:
         ap.error("--keep-open 需要配合 --gui")
     if args.max_decisions is not None and args.max_decisions < 1:
@@ -316,6 +432,9 @@ def main(argv=None) -> int:
     dataset = DatasetStore(args.dataset_out)
     for recovered in dataset.recover():
         print(f"[恢复] {recovered['episode_id']}: {recovered['status']}", flush=True)
+    check_episode_paths(args)
+    if args.workers > 1:
+        return run_parallel(args, dataset)
     task = parse_task(args.task)
     task_text = args.task or task.text()
     results = []
@@ -333,14 +452,19 @@ def main(argv=None) -> int:
             gui = resources.enter_context(GuiViewer(env.model, env.data))
             print("GUI 已打开，开始采集。", flush=True)
         for ep in range(args.episodes):
+            if args.stop_file and Path(args.stop_file).exists():
+                print("停止文件已存在；不再开始新episode。", flush=True)
+                break
             env.reset(seed=args.seed + ep, task=task)
             if gui:
                 gui.sync()
-            ep_dir = next_episode_dir(args.out)
+            ep_dir = episode_path(args.out, args.seed + ep)
+            ep_dir.parent.mkdir(parents=True, exist_ok=True)
+            ep_dir.mkdir(exist_ok=False)
             print(f"\n== episode {ep + 1}/{args.episodes} (seed={args.seed + ep}) -> {ep_dir.name}")
             result = run_episode(env, brain, schemas, task_text, ep_dir, gui=gui,
                                  save_images=not args.no_images, verbose=not args.quiet,
-                                 seed=args.seed + ep, dataset=dataset)
+                                 seed=args.seed + ep, dataset=dataset, episode_name=ep_dir.name)
             results.append(result)
             print(f"   环境判定: {'PASS' if result['success'] else 'FAIL'} "
                   f"({result['reason']}, 决策 {result['decision_rounds']} 轮 / 工具调用 {result['decisions']} 次)")

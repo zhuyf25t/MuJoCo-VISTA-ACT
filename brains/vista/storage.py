@@ -9,6 +9,7 @@ import math
 import os
 import re
 import tempfile
+import time
 from copy import deepcopy
 from pathlib import Path
 
@@ -16,12 +17,19 @@ import numpy as np
 from langchain_core.messages import BaseMessage, message_to_dict
 from PIL import Image
 from observations import FrameObservation, ObservationWindow, OBSERVATION_FPS, STATE_FIELDS
+from process_lock import FileLock
 
 from .settings import VistaSettings
 
 
 class HistoryQueryError(ValueError):
     """A recoverable oversized query, not corrupted stored history."""
+
+
+class GuideConflict(ValueError):
+    def __init__(self, latest):
+        super().__init__("共享指南已被其他进程更新；请读取最新版、合并需要保留的经验后重写。")
+        self.latest = latest
 
 
 def _json_safe(value):
@@ -65,17 +73,22 @@ class VistaStorage:
         self._last_owned_frame: int | None = None
         self._metadata: dict = {}
 
-    def begin_episode(self, collection_dir: Path, task_text: str) -> None:
+    def begin_episode(self, collection_dir: Path, task_text: str, *, episode_name=None) -> None:
         try:
             self.root.mkdir(parents=True, exist_ok=True)
-            guide = self.root / "guide.md"
-            if not guide.exists():
-                with guide.open("x", encoding="utf-8") as handle:
-                    handle.write("暂无经过验证的经验。\n")
-            numbers = [int(match.group(1)) for path in self.root.iterdir()
-                       if path.is_dir() and (match := re.fullmatch(r"ep_(\d+)", path.name))]
-            episode = self.root / f"ep_{max(numbers, default=-1) + 1:04d}"
-            episode.mkdir(exist_ok=False)
+            with self._guide_lock():
+                guide = self.root / "guide.md"
+                if not guide.exists():
+                    _atomic_text(guide, "暂无经过验证的经验。\n")
+            with FileLock(self.root / ".episodes.lock"):
+                if episode_name is None:
+                    numbers = [int(match.group(1)) for path in self.root.iterdir()
+                               if path.is_dir() and (match := re.fullmatch(r"ep_(\d+)", path.name))]
+                    episode_name = f"ep_{max(numbers, default=-1) + 1:04d}"
+                if not re.fullmatch(r"ep_\d+", episode_name):
+                    raise ValueError("无效的 episode 目录名")
+                episode = self.root / episode_name
+                episode.mkdir(exist_ok=False)
             self.episode_dir = episode.resolve()
             (episode / "frames").mkdir()
             (episode / "working.md").write_text(
@@ -229,7 +242,20 @@ class VistaStorage:
             raise RuntimeError(f"MEMORY_IO_ERROR: {kind}.md 丢失或路径已改变")
         return path
 
-    def read_memory(self, kind: str) -> dict:
+    def _guide_lock(self):
+        return FileLock(self.root / ".guide.lock")
+
+    def _guide_audit(self, operation, **fields):
+        """Called with the guide lock held; one complete JSON line per operation."""
+        event = {"time_ns": time.time_ns(), "pid": os.getpid(),
+                 "episode": self.episode_dir.name if self.episode_dir else None,
+                 "operation": operation, **fields}
+        with (self.root / "guide_access.jsonl").open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+
+    def _read_memory_unlocked(self, kind: str) -> dict:
         try:
             content = self._memory_path(kind).read_text(encoding="utf-8")
         except (OSError, UnicodeError):
@@ -237,12 +263,40 @@ class VistaStorage:
         maximum = self.settings.max_guide_chars if kind == "guide" else self.settings.max_working_chars
         if not content.strip() or len(content) > maximum:
             raise RuntimeError(f"MEMORY_IO_ERROR: {kind}.md 为空或超出 {maximum} 字符")
-        return {"content": content, "char_count": len(content),
-                "scope": "environment" if kind == "guide" else "episode"}
+        result = {"content": content, "char_count": len(content),
+                  "scope": "environment" if kind == "guide" else "episode"}
+        if kind == "guide":
+            result["revision"] = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        return result
 
-    def write_memory(self, kind: str, content: str) -> dict:
+    def read_memory(self, kind: str, *, reader="tool") -> dict:
+        if kind != "guide":
+            return self._read_memory_unlocked(kind)
+        with self._guide_lock():
+            result = self._read_memory_unlocked(kind)
+            self._guide_audit("read", revision=result["revision"], reader=reader)
+            return result
+
+    def write_memory(self, kind: str, content: str, *, base_revision=None) -> dict:
         # Tool validation has already checked the full replacement text.
         try:
+            if kind == "guide":
+                with self._guide_lock():
+                    current = self._read_memory_unlocked(kind)
+                    if base_revision != current["revision"]:
+                        self._guide_audit("conflict", base_revision=base_revision,
+                                          current_revision=current["revision"])
+                        raise GuideConflict(current)
+                    revision = hashlib.sha256(content.encode("utf-8")).hexdigest()
+                    archive = self.root / "guide_versions"
+                    archive.mkdir(exist_ok=True)
+                    for version, text in ((current["revision"], current["content"]), (revision, content)):
+                        if not (archive / f"{version}.md").exists():
+                            _atomic_text(archive / f"{version}.md", text)
+                    self._guide_audit("write_attempt", base_revision=base_revision, revision=revision)
+                    _atomic_text(self._memory_path(kind), content)
+                    self._guide_audit("write", base_revision=base_revision, revision=revision)
+                    return {**self._read_memory_unlocked(kind), "written": True}
             _atomic_text(self._memory_path(kind), content)
         except (OSError, UnicodeError):
             raise RuntimeError(f"MEMORY_IO_ERROR: 无法完整写入 {kind}.md") from None

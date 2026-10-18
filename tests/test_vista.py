@@ -288,7 +288,7 @@ def test_multitool_play_feedback_memory_and_second_decision(brain_factory):
         reply(("notes", "write_working", {"content": "计划：抓取后检查球是否抬起。"})),
         play(actions=actions),
         reply(("hist", "history", {}), ("work", "read_working", {})),
-        reply(("guide", "write_guide", {"content": "观察到 f000001 的颜色变化，物理效果仍待确认。"})),
+        reply(("guide", "write_guide", {"content": "观察到 f000001 的颜色变化，物理效果仍待确认。", "base_revision": __import__("hashlib").sha256("暂无经过验证的经验。\n".encode()).hexdigest()})),
         finish(),
     ])
     decisions = decide(brain)
@@ -612,7 +612,7 @@ def test_frame_history_current_pending_and_zero_tick_recovery_have_one_owner(bra
 
 def test_scope_new_episode_preserves_guide_and_resets_working(brain_factory, tmp_path):
     brain = brain_factory([finish()])
-    brain.tools.invoke("write_guide", {"content": "可复用经验"})
+    brain.tools.invoke("write_guide", {"content": "可复用经验", "base_revision": brain.storage.read_memory("guide")["revision"]})
     brain.tools.invoke("write_working", {"content": "旧实验计划"})
     decide(brain)
     brain.accept_finish_result({"tool_call_id": "finish", "accepted": True})
@@ -650,8 +650,33 @@ def test_note_write_failure_does_not_claim_success_or_erase_previous(brain_facto
 
     monkeypatch.setattr(storage, "_atomic_text", fail)
     with pytest.raises(RuntimeError, match="MEMORY_IO_ERROR"):
-        brain.tools.invoke("write_guide", {"content": "new"})
+        brain.tools.invoke("write_guide", {"content": "new", "base_revision": before["revision"]})
     assert brain.storage.read_memory("guide") == before
+
+
+def test_stale_guide_write_requires_reread_and_merge(brain_factory):
+    brain = brain_factory([])
+    before = brain.storage.read_memory("guide")
+    brain.storage.write_memory("guide", "其他进程的经验", base_revision=before["revision"])
+    result, _ = brain.tools.invoke("write_guide", {"content": "旧稿补充", "base_revision": before["revision"]})
+    assert result["error"]["code"] == "GUIDE_CONFLICT" and result["data"]["written"] is False
+    latest, _ = brain.tools.invoke("read_guide", {})
+    assert latest["data"]["content"] == "其他进程的经验"
+    result, _ = brain.tools.invoke("write_guide", {"content": latest["data"]["content"] + "\n本集补充",
+                                                 "base_revision": latest["data"]["revision"]})
+    assert result["ok"] and result["data"]["content"] == "其他进程的经验\n本集补充"
+
+
+def test_shared_guide_refresh_enters_next_model_context_without_advancing_frames(brain_factory):
+    brain = brain_factory([play(), finish()])
+    decide(brain)
+    accept(brain, receipt(brain), observation(1))
+    before = brain.storage.read_memory("guide")
+    brain.storage.write_memory("guide", "OTHER_EPISODE_NEW_EVIDENCE", base_revision=before["revision"])
+    decide(brain, observation(1))
+    messages = json.dumps(api_messages(brain.model.requests[-1]["messages"], brain.system_prompt), ensure_ascii=False)
+    assert "OTHER_EPISODE_NEW_EVIDENCE" in messages
+    assert brain.storage.current_frame_id == "f000001"
 
 
 def test_failed_final_image_records_actions_without_inventing_a_frame(brain_factory, monkeypatch):
@@ -871,7 +896,7 @@ def test_unsuccessful_episodes_continue_with_next_seeds(brain_factory, monkeypat
         execute=lambda *a: (True, "ok"), schemas_anthropic=lambda: SCHEMAS))
     code = run_collect.cli(["--episodes", "3", "--seed", "7", "--max-decisions", "1",
                             "--no-images", "--out", str(tmp_path / "collector"),
-                            "--dataset-out", str(tmp_path / "dataset")])
+                            "--dataset-out", str(tmp_path / "dataset"), "--brain-memory", str(tmp_path / "vista")])
     assert code == 1  # Report unsuccessful collection only after all requested episodes.
     assert state["resets"] == 3 and seeds == [7, 8, 9]
     assert state["closed"] and brain.model.closed and len(brain.model.requests) == 3
@@ -901,7 +926,7 @@ def test_blocked_arm_recovers_without_stopping_collection(brain_factory, monkeyp
     monkeypatch.setattr(run_collect, "MobileManipEnv", lambda: env)
     monkeypatch.setattr(run_collect, "build_brain", lambda *a: brain)
     code = run_collect.cli(["--episodes", "2", "--no-images", "--out", str(tmp_path / "collector"),
-                            "--dataset-out", str(tmp_path / "dataset")])
+                            "--dataset-out", str(tmp_path / "dataset"), "--brain-memory", str(tmp_path / "vista")])
     assert code == 1 and state["resets"] == 2 and len(brain.model.requests) == 3
     record = lines(tmp_path / "vista/ep_0000/actions.jsonl")[0]
     assert record["execution_status"] == "failed"
@@ -1055,7 +1080,7 @@ def test_execution_failure_stops_remaining_actions_and_entire_cli(brain_factory,
     monkeypatch.setattr(run_collect, "ToolLayer", lambda *a, **k: SimpleNamespace(
         execute=execute, schemas_anthropic=lambda: SCHEMAS))
     code = run_collect.cli(["--brain=vista", "--episodes", "3", "--no-images", "--out", str(tmp_path / "collector"),
-                            "--dataset-out", str(tmp_path / "dataset")])
+                            "--dataset-out", str(tmp_path / "dataset"), "--brain-memory", str(tmp_path / "vista")])
     assert code == 1 and state["resets"] == 1 and state["closed"] and brain.model.closed
     assert executed == ["observe", "forward"] and len(brain.model.requests) == 1
     assert state["ticks"] == 0

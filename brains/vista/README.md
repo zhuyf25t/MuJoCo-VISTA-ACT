@@ -134,7 +134,7 @@ A 的结束观察和 B 的开始观察共用 O3 的 `frame_id`。所有过程帧
 | `read_pixels` | `question, views` | 按区域网格读取原始 RGB；每个 view 指定 `label, frame_id, region, rows, columns` |
 | `history` | 可选 `mode, start, end, step, limit` | 按完整批次或等差帧查询；包含当前 pending 观测，返回续查参数 |
 | `read_guide` | 无 | 读取跨 episode 的环境经验 |
-| `write_guide` | `content` | 完整替换环境指南 |
+| `write_guide` | `content, base_revision` | 按已读版本完整替换共享指南；冲突后重读、合并、重写 |
 | `read_working` | 无 | 读取本 episode 的计划、假设和未决问题 |
 | `write_working` | `content` | 完整替换本集草稿 |
 | `play` | `actions, expectation, basis_frame_id` | 提交一批连续执行的动作 |
@@ -157,7 +157,9 @@ batch 单次返回的 observations 合计上限默认 500，超过返回可修�
 
 ### 两份笔记
 
-`guide.md` 保存适用于同一环境设定的稳定经验，跨 episode 保留；`working.md` 每集新建，保存当前计划、待验证假设、矛盾和相关帧。初始请求主动读入两份笔记，后续由模型按需读写。
+`guide.md` 保存适用于同一环境设定的稳定经验，跨 episode、跨进程共享；`working.md` 每集新建，保存当前计划、待验证假设、矛盾和相关帧。初始请求主动读入两份笔记。每次模型请求前检查guide版本，有变化时把新版全文和revision加入上下文；模型也可主动read_guide。
+
+guide读写使用短进程锁，思考和网络请求不持锁。write_guide必须携带已读base_revision；锁内校验当前revision，版本过期时返回可重试的GUIDE_CONFLICT且不改文件。模型须重读最新版、保留他人有效经验并合并自己的补充后重写。guide_access.jsonl记录时间、PID、episode、操作和版本，guide_versions按内容版本保存历史全文；时间戳用于审计，不用于冲突判断。所有使用新程序且共享同一记忆根目录的进程均受此协议保护。
 
 两个写工具都做**完整替换**，需要保留的内容必须包含在新文本中；默认上限分别为 8000 和 4000 字符。没有自动摘要或自动更新笔记：执行后是否修订假设、是否将经验写入指南，由模型根据回执和图像决定。更换相机、控制参数或任务设定时，应检查指南适用性或使用新的记忆目录。
 
@@ -215,6 +217,8 @@ batch 单次返回的 observations 合计上限默认 500，超过返回可修�
 ```text
 output/vista/
 ├── guide.md
+├── guide_access.jsonl
+├── guide_versions/
 └── ep_0000/
     ├── working.md
     ├── frames/

@@ -162,6 +162,16 @@ python run_collect.py --brain vista --gui --episodes 5 --seed 0 --max-decisions 
 
 云端无窗口采集去掉 `--gui`，并使用前述 EGL 配置。`--seed` 为首集场景，后续逐次递增；再次采集新场景时相应调整起始 seed。`--max-decisions` 限制每集外层决策次数，`max_model_calls` 限制每次决策内部的模型请求次数。
 
+无窗口并发使用 `--workers 4`（也支持10等正整数，默认1）。`--episodes`始终是总集数，不是每个进程的集数。每个进程独立创建仿真、相机和模型客户端；`--workers > 1`不能搭配`--gui`。例如：
+
+```bash
+python run_collect.py --workers 4 --episodes 10 --seed 0 --max-decisions 32 --out data/episodes/run_002 --brain-memory output/vista/run_002 --dataset-out data/act_v1
+```
+
+原始数据与VISTA目录都按seed命名：seed 7对应两处的`ep_0007`，与启动/完成顺序无关；已有目录报错，不覆盖或偷偷改号。ACT HDF5继续使用manifest管理唯一编号，`manifest.episodes[].seed`与`source_dir`记录对应关系，数据格式不变。并行子进程日志在原始episode目录的`collector.log`，结果和实际耗时在`worker_result.json`。第一次Ctrl+C停止派发，等待当前各集完成；再次Ctrl+C中断。也可传`--stop-file tmp/STOP`，该文件出现后不再启动新集（串行也支持）。
+
+所有进程共享`--brain-memory/guide.md`。短文件锁串行化读写，模型调用不持锁；`write_guide(content, base_revision)`按版本检查，冲突返回`GUIDE_CONFLICT`，由VISTA重读最新版、合并经验后重写。每次模型请求前发现guide变化会注入新版内容。`guide_access.jsonl`记录进程、episode、时间及读写版本，`guide_versions/`保留写入前后全文。`working.md`、帧与history仍按episode隔离。独立启动的采集命令使用同一记忆根目录时，也遵循同一套锁与版本协议。
+
 文件布局、LangGraph 状态与图、九个工具及控制约定见 [VISTA README](brains/vista/README.md)。
 
 ## ACT
