@@ -5,9 +5,7 @@ model:
   image_hw: [240, 320]
   chunk_size: 32
   hidden_dim: 512
-  latent_dim: 32
   nheads: 8
-  posterior_layers: 2
   encoder_layers: 4
   decoder_layers: 7
   dim_feedforward: 2048
@@ -18,10 +16,9 @@ training:
   learning_rate: 0.0001
   backbone_learning_rate: 0.00001
   weight_decay: 0.0001
-  kl_weight: 10.0
   grad_clip: 1.0
   seed: 42
-  num_workers: 0
+  num_workers: 8
   amp: false
   patience: 0
   min_delta: 0.0

@@ -1,7 +1,6 @@
-"""ACT core: spatial ResNet features, training-only CVAE posterior, action queries.
+"""ACT v2: unchanged visual/Transformer trunk, four supervised action heads.
 
-Based on the design in act.md; not an exact reproduction of upstream ACT.
-ImageNet normalization happens here, once. Inference uses the prior mean z=0.
+The latent token is deterministic in training and inference; no CVAE posterior.
 """
 import math
 import torch
@@ -88,61 +87,27 @@ class ACT(nn.Module):
         self.backbone = nn.Sequential(*list(backbone.children())[:-2])
         self.visual_projection = nn.Conv2d(512, d, kernel_size=1)
         self.state_projection = nn.Linear(cfg.state_dim, d)
-        self.z_projection = nn.Linear(cfg.latent_dim, d)
+        self.latent_token = nn.Parameter(torch.zeros(1, 1, d))
         self.type_pos = nn.Embedding(3, d)  # state / z / image
         self.camera_pos = nn.Embedding(len(cfg.cameras), d)
         self.action_queries = nn.Embedding(cfg.chunk_size, d)
         self.encoder = nn.ModuleList([EncoderLayer(cfg) for _ in range(cfg.encoder_layers)])
         self.decoder = nn.ModuleList([DecoderLayer(cfg) for _ in range(cfg.decoder_layers)])
         self.decoder_norm = nn.LayerNorm(d)
-        self.action_head = nn.Linear(d, cfg.action_dim)
-
-        self.cls = nn.Parameter(torch.zeros(1, 1, d))
-        self.posterior_state = nn.Linear(cfg.state_dim, d)
-        self.posterior_action = nn.Linear(cfg.action_dim, d)
-        self.posterior_encoder = nn.ModuleList(
-            [EncoderLayer(cfg) for _ in range(cfg.posterior_layers)]
-        )
-        self.posterior_head = nn.Linear(d, 2 * cfg.latent_dim)
+        self.arm_head = nn.Linear(d, 2)
+        self.gripper_head = nn.Linear(d, 2)
+        self.base_head = nn.Linear(d, 5)
+        self.turn_head = nn.Linear(d, 1)
         self.register_buffer("rgb_mean", torch.tensor([.485, .456, .406]).view(1, 1, 3, 1, 1))
         self.register_buffer("rgb_std", torch.tensor([.229, .224, .225]).view(1, 1, 3, 1, 1))
 
-    def encode_posterior(self, state, actions, is_pad):
-        B = state.shape[0]
-        tokens = torch.cat((self.cls.expand(B, -1, -1),
-                            self.posterior_state(state).unsqueeze(1),
-                            self.posterior_action(actions)), dim=1)
-        pos = sine_1d(torch.arange(tokens.shape[1], device=state.device),
-                      self.cfg.hidden_dim).unsqueeze(0)
-        prefix_mask = torch.zeros(B, 2, device=state.device, dtype=torch.bool)
-        mask = torch.cat((prefix_mask, is_pad), dim=1)
-        for layer in self.posterior_encoder:
-            tokens = layer(tokens, pos, mask)
-        mu, logvar = self.posterior_head(tokens[:, 0]).chunk(2, dim=-1)
-        z = mu + torch.exp(0.5 * logvar) * torch.randn_like(mu)
-        return z, mu, logvar
-
-    def forward(self, images, state, actions=None, is_pad=None):
+    def forward(self, images, state):
         # images 已在 [0,1]；这里仅做 ImageNet 标准化。
         if images.ndim != 5 or tuple(images.shape[1:]) != (len(self.cfg.cameras), 3, *self.cfg.image_hw):
             raise ValueError("Expected images [B,cameras,3,H,W] matching configuration")
         B, C, _, H, W = images.shape
         if state.shape != (B, self.cfg.state_dim):
             raise ValueError("State shape mismatch")
-        if actions is not None and (actions.shape != (B, self.cfg.chunk_size, self.cfg.action_dim)
-                                    or is_pad is None or is_pad.shape != (B, self.cfg.chunk_size)
-                                    or is_pad.dtype != torch.bool):
-            raise ValueError("Action or padding shape/dtype mismatch")
-        if C != len(self.cfg.cameras):
-            raise ValueError("Camera count mismatch")
-        if actions is None:
-            z = state.new_zeros(B, self.cfg.latent_dim)
-            mu = logvar = None
-        else:
-            if is_pad is None:
-                raise ValueError("Posterior needs an explicit padding mask")
-            z, mu, logvar = self.encode_posterior(state, actions, is_pad)
-
         pixels = (images - self.rgb_mean) / self.rgb_std
         feature = self.visual_projection(self.backbone(pixels.reshape(B * C, 3, H, W)))
         _, d, h, w = feature.shape
@@ -151,7 +116,7 @@ class ACT(nn.Module):
         image_pos = (spatial_pos + self.camera_pos.weight[:, None, :]
                      + self.type_pos.weight[2]).reshape(1, C * h * w, d)
         state_token = self.state_projection(state).unsqueeze(1)
-        z_token = self.z_projection(z).unsqueeze(1)
+        z_token = self.latent_token.expand(B, -1, -1)
         memory = torch.cat((state_token, z_token, visual), dim=1)
         pos = torch.cat((self.type_pos.weight[:2].unsqueeze(0), image_pos), dim=1)
         for layer in self.encoder:
@@ -161,6 +126,6 @@ class ACT(nn.Module):
         h = torch.zeros_like(query_pos)
         for layer in self.decoder:
             h = layer(h, query_pos, memory, pos)
-        # 读取最后一层；线性回归头不使用 sigmoid 或 softmax。
-        prediction = self.action_head(self.decoder_norm(h))
-        return prediction, mu, logvar
+        h = self.decoder_norm(h)
+        return {"arm": self.arm_head(h), "gripper_logits": self.gripper_head(h),
+                "base_logits": self.base_head(h), "turn": self.turn_head(h).sigmoid()}

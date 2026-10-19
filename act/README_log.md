@@ -2,7 +2,7 @@
 
 本文解释 `act/` 的模块职责、数据流和实现逻辑，面向第一次亲手训练模型的读者。使用入口见 [ACT README](README.md)，云端安装见[项目环境配置](../README.md#环境配置)。
 
-这个项目用成功的专家轨迹做模仿学习：给定当前前视图和机器人实测状态，预测未来 32 拍动作。训练时用专家动作计算误差并更新网络；部署时网络自己预测，MuJoCo 执行动作后产生下一张图。当前实现参考 ACT 的 CVAE、动作分块和 Transformer 设计，包含本项目自己的数据契约与控制适配，不是上游代码的逐行复刻。
+这个项目用成功的专家轨迹做模仿学习：给定当前前视图和机器人实测状态，预测未来 32 拍动作。训练时用专家动作计算误差并更新网络；部署时网络自己预测，MuJoCo 执行动作后产生下一张图。当前 v2 实现保留 ACT 的动作分块和 Transformer，使用分类与回归混合头及确定性 latent，包含本项目自己的数据契约与控制适配，不是上游代码的逐行复刻。
 
 ## 1. 先认识文件之间的关系
 
@@ -16,7 +16,7 @@ prepare.py ── common.py 检查 ──→ 实验目录中的清单、划分�
                                     ↓
 train.py → dataset.py → model.py → 损失、反向传播、AdamW 更新
     │                         ↓
-    └── validate(z=0) → metrics.jsonl / best.pt / last.pt
+    └── validate(混合损失) → metrics.jsonl / best.pt / last.pt
                                     ↓
 policy.py → 当前图像和实测状态 → 五维动作
                                     ↓
@@ -31,7 +31,9 @@ rollout.py → SimActionAdapter → MuJoCo → 新观测 / 成功率 / 视频
 | `common.py` | 数据契约、可迁移路径、内容哈希、原子写入 |
 | `prepare.py` | 选择合格轨迹、按场景划分、统计与冻结 |
 | `dataset.py` | 将轨迹中的每个时刻变成一个训练样本 |
-| `model.py` | 图像骨干、训练用后验、观测编码器、动作解码器 |
+| `model.py` | 图像骨干、确定性 latent、观测编码器、动作解码器与四头输出 |
+| `action_codec.py` / `losses.py` | 类别与物理单位映射、有效 chunk 类别权重、混合损失 |
+| `checkpoint.py` | 混合模型 checkpoint 保存/读取与格式校验 |
 | `train.py` | 优化、离线验证、进度显示、模型保存与恢复 |
 | `policy.py` | 从 checkpoint 重建模型、预处理、时间集成、反归一化 |
 | `rollout.py` | 预测动作转成仿真命令，记录闭环结果 |
@@ -90,12 +92,10 @@ manifest 顶层为 `schema`、`episodes`。schema 名为 `mobile_act_v1`，固�
 
 | 模型参数 | 默认值 | 实际作用 |
 | --- | --- | --- |
-| state_dim / action_dim | 5 / 5 | 状态投影输入维数 / 动作头输出维数 |
+| state_dim / action_dim | 5 / 5 | 实测状态维数 / 解码后的动作维数 |
 | cameras / image_hw | front / 240×320 | 数据契约；当前端到端管线只接受这个组合 |
 | chunk_size | 32 | 动作查询数量与标签块长度 |
 | hidden_dim / nheads | 512 / 8 | token 宽度 / 注意力头数，每头 64 维 |
-| latent_dim | 32 | CVAE 潜变量维数 |
-| posterior_layers | 2 | 用专家动作编码训练后验的层数 |
 | encoder_layers / decoder_layers | 4 / 7 | 观测编码器 / 动作解码器深度 |
 | dim_feedforward / dropout | 2048 / 0.1 | 各 Transformer 层的 FFN 中间宽度 / 丢弃比例 |
 | pretrained_backbone | true | 新训练时载入 ImageNet ResNet-18 权重 |
@@ -106,10 +106,9 @@ manifest 顶层为 `schema`、`episodes`。schema 名为 `mobile_act_v1`，固�
 | learning_rate | 0.0001 | 除图像骨干外的 AdamW 学习率 |
 | backbone_learning_rate | 0.00001 | ResNet 卷积微调学习率 |
 | weight_decay | 0.0001 | AdamW 权重衰减 |
-| kl_weight | 10 | 损失中 KL 项系数 |
 | grad_clip | 1 | 参数梯度总范数上限 |
 | seed | 42 | 训练随机种子；与 prepare 的 split seed 分开设置 |
-| num_workers | 0 | DataLoader 子进程数，0 最易排错 |
+| num_workers | 0（baseline.yaml 为 8） | DataLoader 子进程数，0 最易排错 |
 | amp | false | 是否启用 CUDA FP16 混合精度 |
 | patience / min_delta | 0 / 0 | 0 表示关闭早停；否则按改善幅度和等待轮数停止 |
 
@@ -197,7 +196,7 @@ python -m act.prepare --dataset-root data/act_v1 --experiment output/act/exp_002
 
 ### 7.1 ResNet-18 保留空间信息
 
-`ACT.__init__()` 创建 torchvision ResNet-18，使用 FrozenBatchNorm2d，删去全局平均池化和分类头。FrozenBatchNorm 的统计量与仿射量固定；卷积参数仍然训练。标准 ResNet-18 含分类头约 1,169 万参数；这里骨干可训练参数 11,166,912，整个默认 ACT 为 59,853,573。
+`ACT.__init__()` 创建 torchvision ResNet-18，使用 FrozenBatchNorm2d，删去全局平均池化和分类头。FrozenBatchNorm 的统计量与仿射量固定；卷积参数仍然训练。标准 ResNet-18 含分类头约 1,169 万参数；这里骨干可训练参数 11,166,912，完整参数量在训练启动时打印。
 
 新训练默认加载 `ResNet18_Weights.IMAGENET1K_V1`。它从 PyTorch 官方下载约 45 MB，不需要 Hugging Face；`--backbone-weights` 可传本地官方 state_dict。恢复/推理设置 `initialize_backbone=False`，直接恢复完整 ACT 权重，不重复下载。
 
@@ -220,17 +219,12 @@ python -m act.prepare --dataset-root data/act_v1 --experiment output/act/exp_002
 
 `EncoderLayer` 为 post-norm 结构：令 Q=K=x+pos、V=x，注意力更新经 dropout 与残差相加，再 LayerNorm；随后 Linear→ReLU→Dropout→Linear 的 FFN，再残差、LayerNorm。位置作用于注意力寻址，不混进 V。后验 encoder 可以额外传 padding mask。
 
-### 7.3 训练后验：为什么训练会读取答案
+### 7.3 确定性 latent
 
-训练时 `encode_posterior()` 把 `[CLS]`、投影后的当前 state、K 个投影后的专家动作接成 `[B,K+2,512]`，加入一维位置编码，经两层后验 encoder。mask 的前两位 False，随后直接接动作 padding mask。
-
-CLS 输出投影成 `2×latent_dim`，分成 μ、logvar；logvar 表示方差的对数。用重参数化得到：
-
-`z = μ + exp(0.5×logvar) × ε，ε ~ N(0,I)`。
-
-这一路让训练时的潜变量概括专家未来动作，但 KL 项约束后验不要任意偏离标准正态。梯度通过重参数化流向后验网络，不更新数据标签。后验不输入图片；预测网络同时读取图片、state 和 z。
-
-验证/部署没有未来专家动作可供读取。只要 `actions is None`，forward 就创建全零 z，并令 μ/logvar=None；此处取先验均值，不随机抽先验噪声。`model.eval()` 自身不会禁止后验，真正控制后验的是有没有传 actions。
+当前模型不创建 CVAE 后验，不把专家未来动作输入网络，不计算 KL。
+`latent_token` 是一个可学习但与当前标签无关的常量向量，训练和推理共用；它相当于固定 z
+经过带偏置投影后的 token。训练和推理都不经过后验网络。
+这一选择用于先验证混合动作头；不是分类头在数学上要求关闭 CVAE。
 
 ### 7.4 观测 encoder 和动作 decoder
 
@@ -238,7 +232,11 @@ CLS 输出投影成 `2×latent_dim`，分成 μ、logvar；logvar 表示方差�
 
 每个 `DecoderLayer` 先在 K 个动作位置之间自注意力，再以动作表示为 query、观测 memory 为 key/value 做交叉注意力，最后走 FFN；每段均有 dropout、残差、LayerNorm。自注意力没有 causal mask：32 拍同时预测，不是依次生成并把上一拍输出喂回去。
 
-7 层后经 `decoder_norm` 和 `Linear(512,5)` 输出标准化连续动作。头部没有 sigmoid/softmax，也没有额外 padding 分类头。即使夹爪目标为二值，训练时仍将它当连续数做 L1；执行阈值在 rollout 适配器处理。
+7 层后经 decoder_norm，分别接 Linear(512,2) 肩肘头、Linear(512,2) 夹爪 logits、
+Linear(512,5) 底盘 logits、Linear(512,1)+sigmoid 转向幅度。每个位置仍代表一拍。
+肩肘保持标准化回归；夹爪 closed/open 解码为 0/1；底盘 stop/forward/back/left/right
+解码为 (v,w)=(0,0)/(0.3,0)/(-0.3,0)/(0,r)/(0,-r)。v 单位 m/s，r 单位 rad/s，范围 0–1。
+最终动作仍是五维；不调用 VISTA 的多拍工具。
 
 ## 8. train.py：参数怎样更新，结果怎样被保存
 
@@ -252,62 +250,62 @@ AdamW 分为 backbone 与其余参数两组学习率。AMP 仅在配置开启且
 
 ### 8.2 一次更新与损失
 
-循环依次执行：搬 batch 到设备 → 清零梯度 → 带专家动作的 forward → 算损失 → backward → unscale → 梯度裁剪 → optimizer.step → scaler.update。
-
-设有效动作位置 mask 为 M，D=5，标准化预测为 p，标签为 a：
-
-`L1 = sum(M×abs(p-a)) / (sum(M)×D)`
-
-`KL = mean_batch[-0.5×sum_latent(1+logvar-μ²-exp(logvar))]`
-
-`loss = L1 + kl_weight×KL`。
-
-masked_l1 用 `torch.where` 排除补齐位置，而不是让补齐零参与平均。如果一批两条 sample 分别剩 2、1 个动作，分母为 `(2+1)×5=15`；15 个有效误差都为 0.2 时 L1 就为 0.2，无论后面补多少零。若 KL=0.01、系数=10，总损失为 0.3。AdamW 根据这个总损失的梯度更新模型；一次下降不保证下一轮验证改善。
-
-非有限 loss 或梯度会报错。epoch 的 train_l1 按有效动作元素数量加权，train_kl 按 sample 数加权，不是随意平均各 batch 的均值。重叠动作块使某一真实动作可能在多个预测起点下重复计入；指标衡量的是“各起点的未来块预测误差”。
-
-### 8.3 validate：不做反向传播
-
-`@torch.no_grad()` 加 `model.eval()` 禁止梯度、关闭 dropout；forward 不传专家动作，用 z=0 预测。专家动作只在预测之后用于评分。它们不会泄漏进输入。
-
-| 文件里的指标名 | 终端/数学含义 | 应怎样看 |
-| --- | --- | --- |
-| train_loss | train_l1 + kl_weight × train_kl | 本轮累计训练总损失；与纯动作验证 L1 的定义不同 |
-| train_l1 | 训练动作误差，训练后验 z | 是否能拟合示范；与验证的 z 条件不同 |
-| train_kl | 每 sample 的后验 KL | 观察潜变量正则化；不是任务分数 |
-| val_l1_z0 | 五维标准化绝对误差平均 | 越低越好；选择 best.pt 的依据 |
-| val_mae_physical | 每维标准化 MAE 乘训练 std | 分别是 rad、rad、ratio、m/s、rad/s |
-| val_first_mae_physical | 每个 sample 只统计第一个动作 | 更直接对应默认每拍执行第一动作 |
-| val_gripper_accuracy | 物理开度按 0.5 判断开/闭 | 不是抓取成功率；也不同于执行的 0.4/0.6 滞回 |
-| elapsed_seconds | 本轮训练和验证耗时 | 当前计时不含后续保存 checkpoint 的耗时 |
-
-val_l1_z0=0.253 不等于 25.3% 错误，也不是 25.3% 成功率。不同实验若更换了训练统计，标准化 L1 的尺度也可能变化；比较时同时看物理 MAE、固定验证场景成功率与视频。
-
-### 8.4 进度条与每轮摘要
-
-训练使用 tqdm，训练阶段 `Train 01/20` 和验证阶段 `Valid 01/20` 在底部依次动态更新。显示 batch 完成比例、耗时、预计剩余时间和当前累计 loss；它们都是**该阶段**的进度，不是整个训练的进度。训练条显示 train_loss、train_L1 和 val_loss=pending；验证条保留本轮 train_loss 并更新 val_loss（即 val_l1_z0）。阶段结束保留最终进度行，再打印中文摘要，格式如下：
+每个 epoch 均匀打乱所有训练起点。forward 只读图像和实测状态，随后用未来动作标签计算：
 
 ```text
-第 10/20 轮 | 73.0 秒 | 累计更新 9,430 次
-  训练总 loss=... | 训练动作 L1=... | KL=... | 验证动作 L1(z=0)=0.2531（越低越好）
-  验证 MAE：肩 ... rad | 肘 ... rad | 夹爪 ... | 前进 ... m/s | 转向 ... rad/s
-  夹爪开闭准确率=87.0% | 最佳验证 L1=0.2531（第 10 轮） | 已更新 best.pt；已保存 last.pt
-  早停计数=0/5（有效改善需超过 0.001）
+loss = 肩肘标准化 L1 均值 + 夹爪 CE 均值
+     + 按训练频次加权的底盘 CE 均值 + 真值转向位置的幅度 L1 均值
 ```
 
-上面是输出格式示意，不是重新训练的结果。`--progress auto` 默认在终端显示动态条；重定向文件或经 `tee` 管道后，约每 10 秒在下一个 batch 结束时写一行进展，阶段开始/结束也会报告。`always` 强制动态条，`never` 仅阶段提示与摘要。它不能在阻塞的 batch 内报告进度。`BatchProgress` 管理这些显示，`print_epoch_summary` 负责中文摘要；不改变优化计算。使用 tmux 可以保留交互会话。`metrics.jsonl` 新增 train_loss，原有字段保持；文件 epoch 从 0 开始，显示从 1 开始。视频命令见 [ACT README](README.md#在-mujoco-中运行策略并生成视频)。
+四项固定系数 1，没有额外 loss 调参开关。幅度按 1 rad/s 归一化，不能把前进 m/s 当转向幅度。
+分类交叉熵直接接 logits，训练不经过 argmax；幅度损失按真值是否转向选择，预测错成 stop
+也有幅度梯度。所有项先索引有效位置再计算，padding 不进入损失；没有转向的 batch 幅度项为零。
+
+训练集每个实际动作 t 会出现在 min(K,t+1) 个有效 chunk 位置。按此统计 N_c，取
+w_c=N/(C_present*N_c)，让存在的底盘类别对平均 CE 的总贡献相等。权重只读训练集，
+不改变验证分布、不重采样，不删除静止帧。加权 CE 用有效位置数作分母，避免 batch 内
+只有一种类别时，除以权重和把稀有类权重消掉。class_balance.json 和 checkpoint 均保存统计。
+
+AdamW 更新前 unscale 并裁剪梯度，非有限 loss 或梯度明确报错。
+
+### 8.3 验证与记录
+
+验证使用 no_grad/eval，关闭 dropout，与训练使用同一确定性 latent。各损失分别累计后
+除以自己的有效标签数量，因此验证结果不依赖 batch 如何切分。训练指标是在参数持续
+更新期间累计，不能与最终固定参数验证作完全等同的比较。
+
+| 指标 | 含义 |
+| --- | --- |
+| train_loss / val_loss | 四头混合目标；val_loss 选择 best 并用于早停 |
+| train/val_arm_l1、gripper_ce、base_ce、turn_l1 | 各项损失，不混淆单位和分母 |
+| train_l1 / val_l1 | 解码后的五维标准化 L1 |
+| val_mae_physical / val_first_mae_physical | 整块/第一拍的五维物理误差 |
+| val_base_recall / val_first_base_recall | 底盘五类逐类召回；同时保存混淆矩阵和宏平均 |
+| val_gripper_recall | 开/闭逐类召回；另有从闭到开、从开到闭的机会召回 |
+| val_first_turn_* | 左右启动、停止、误转向等切换指标 |
+
+标签来自命令而非实测速度。启动转向要求实测 |w|<0.05、标签 |w|>0.2，
+预测方向相同且 |w|>0.2 才算正确；停止时预测 |w|<0.05 才算正确。
+前后行启动和开闭爪机会也单独报告。全零策略不能靠大量静止标签获得高转向召回。
+离线召回和 loss 都不是完整任务成功率，必须再看 MuJoCo 闭环结果。
+
+### 8.4 进度输出
+
+Train 和 Valid 阶段分别报告当前 batch 进度。train_loss/val_loss 为混合损失，train_L1 为
+附带诊断。验证未开始时显示 pending。progress auto 在终端用动态条、重定向时约每 10 秒
+在 batch 结束后输出一行；always 强制条，never 只保留摘要。metrics.jsonl 的 epoch 从零开始。
 
 ### 8.5 best、last 与早停
 
-每轮验证后：只要 score 严格小于历史最小值就更新 best；另用 `score < early_best - min_delta` 判断“足够改善”，否则 stale 加一。patience>0 且 stale 达到 patience 时正常早停。
+每轮验证后 score=val_loss：只要 score 严格小于历史最小值就更新 best；另用 `score < early_best - min_delta` 判断“足够改善”，否则 stale 加一。patience>0 且 stale 达到 patience 时正常早停。
 
 例如 best 从 0.2530 降至 0.2528，best.pt 会更新；当 min_delta=0.001 时，这次改善未必重置早停计数，因为 early_best 是另一个参考值。因此“更新 best”和“早停计数归零”不是同一个条件。
 
-`save_checkpoint()` 使用临时文件、fsync、替换；每轮先写 last，若有新最佳再写 best，最后追加指标。checkpoint 包含 format_version、模型、优化器、GradScaler、结构配置、schema、归一化统计、prepared 元数据、epoch/global_step、best 与早停状态、随机状态、当轮指标、版本来源。模型文件约 719 MB，推理参数本身约 240 MB，其余主要包括 AdamW 状态。
+`save_checkpoint()` 使用临时文件、fsync、替换；每轮先写 last，若有新最佳再写 best，最后追加指标。checkpoint 包含 format_version、模型、优化器、GradScaler、结构配置、schema、归一化统计、prepared 元数据、epoch/global_step、best 与早停状态、随机状态、当轮指标、版本来源。v2 还保存 action_codec、class_balance 和 selection_metric；文件大小随网络配置与优化器状态变化。
 
 ### 8.6 resume 的边界
 
-`--resume` 固定读取实验目录的 last.pt，恢复完整状态，不重新载入 ImageNet。配置和冻结数据必须一致，epochs 表示总轮数；已训练 2 轮后 `--epochs 20` 是再做最多 18 轮。
+本分支只加载混合动作头 checkpoint；旧五维回归权重不可用。它固定读取实验目录的 last.pt，恢复完整状态，不重新载入 ImageNet。配置和冻结数据必须一致，epochs 表示总轮数；已训练 2 轮后 `--epochs 20` 是再做最多 18 轮。
 
 随机状态包含 Python、NumPy、torch、DataLoader generator 和可用 CUDA RNG。恢复还会补写因中断未发布的 best、修复 metrics 到 checkpoint 的轮次。相同环境 CPU 测试验证了完整两轮与一轮后恢复的权重逐位相同；不同驱动/设备不保证逐位一致。
 
@@ -319,11 +317,15 @@ val_l1_z0=0.253 不等于 25.3% 错误，也不是 25.3% 成功率。不同实�
 
 `predict_chunk(images_rgb, measured_state)` 检查图片与 state 形状，按训练统计标准化 state，图片转 [0,1]，加 batch 维并前向。返回 `[K,5]` **标准化**动作块。`@torch.inference_mode()` 进一步关闭推理中的梯度相关开销。
 
-`act()` 默认取 chunk[0]，然后 `action = normalized×action_std + action_mean` 返回物理单位。每调用一次 step 加一。每个新场景必须 `reset()`，清除 step 与时间集成历史。
+`act()` 每拍重新预测，默认执行新块第一拍，没有 execution_horizon 参数。
+新场景 reset 会清除 step 和时间集成历史。
 
-`TemporalEnsembler.select(step, chunk)` 保存仍能覆盖当前时刻的旧预测。旧块起于 s，则取 `chunk[step-s]`，因此所有候选都指向同一个执行时刻。按旧到新顺序 i=0,1,... 使用 `exp(-m×i)` 并归一化：正 m **偏向较旧预测**，m=0 为平均。不是对同一块不同未来时刻求平均，也不会把有效零动作误当 padding。
-
-比如第 0 拍预测第 1 拍动作是 0，第 1 拍新预测当前动作是 2；m=0 时输出 1。时间集成可能平滑动作，也可能延迟切换，默认关闭。它在标准化空间融合后再反归一化。
+时间集成仍可使用 ensemble_coefficient；它对齐不同块中指向同一个控制时刻的预测，
+按旧到新 i=0,1,... 的 exp(-m*i) 归一化权重融合，正 m 偏向旧块。
+v2 先融合两组类别概率再选类别，肩肘按连续目标融合。对选中的左/右方向，幅度取
+sum(weight * p_direction * magnitude) / sum(weight * p_direction)，再赋予该方向的符号。
+不会直接把左转和右转的有符号速度平均到零。停止/直行时转向幅度不参与执行。
+集成可能延迟切换，默认关闭，应固定 checkpoint/seeds 对比。
 
 ## 10. rollout.py：从动作到闭环任务结果
 
@@ -335,7 +337,7 @@ env.success 所用物体真值仅评分，不作为策略输入。录像使用�
 
 ### SimActionAdapter 的实际规则
 
-关节目标先限于机械范围，再限制每拍目标变化不超过 `3 rad/s × 0.1 s = 0.3 rad`。夹爪输出先裁剪到 [0,1]，≥0.6 为开、≤0.4 为闭，中间保持原状态。只有开到闭的转换才开启一次 1.2 秒抓取判定；持续闭合不会每拍重新计时。底盘 v/w 经 HAL 的 command_drive 执行和限幅。stop 会停底盘并结束抓取尝试。
+关节目标限于机械范围后直接施加，不再对已有逐拍目标重复限速。夹爪输出先裁剪到 [0,1]，≥0.6 为开、≤0.4 为闭，中间保持原状态。只有开到闭的转换才开启一次 1.2 秒抓取判定；持续闭合不会每拍重新计时。底盘 v/w 经 HAL 的 command_drive 执行和限幅。stop 会停底盘并结束抓取尝试。
 
 这里有尚未解决的表达限制：专家可以连续调用两次高层 close_gripper，而五维目标里第二次调用仍然是相同的“闭合”，无法表示新的调用边界。当前适配器是明确的基线，不能宣称完全复现专家内部抓取状态。
 
@@ -365,6 +367,6 @@ env.success 所用物体真值仅评分，不作为策略输入。录像使用�
 
 ### 区分自动产物与自定义报告
 
-`prepare.py` 生成数据快照、划分、统计和校验信息；`train.py` 自动生成 `config.yaml`、`runtime.json`、`metrics.jsonl`、`best.pt` 和 `last.pt`；`rollout.py` 生成评估摘要、轨迹及可选视频。曲线、额外汇总和精简权重文件需要另行生成，训练程序也不负责关闭云端实例。
+`prepare.py` 生成数据快照、划分、统计和校验信息；`train.py` 自动生成 `config.yaml`、`runtime.json`、`class_balance.json`、`metrics.jsonl`、`best.pt` 和 `last.pt`；`rollout.py` 生成评估摘要、轨迹及可选视频。曲线、额外汇总和精简权重文件需要另行生成，训练程序也不负责关闭云端实例。
 
 参考：[ACT 原实现](https://github.com/tonyzhaozh/act)、[torchvision ResNet-18](https://docs.pytorch.org/vision/0.25/models/generated/torchvision.models.resnet18.html)、[PyTorch 对应版本安装](https://pytorch.org/get-started/previous-versions/)。模块行为以本项目源码为准。

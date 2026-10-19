@@ -178,7 +178,7 @@ python run_collect.py --workers 4 --episodes 10 --seed 0 --max-decisions 32 --ou
 
 #### 数据准备与训练
 
-ACT 使用 ImageNet 预训练 ResNet-18 提取视觉特征，通过 CVAE 和 Transformer 预测未来动作块。默认 **K=32、batch size=8、单车头相机、五维状态与动作**。一个样本对应一个控制时刻；一个 episode 可以提供多个样本。
+ACT 使用 ImageNet 预训练 ResNet-18 提取视觉特征，通过 Transformer 和混合动作头预测未来动作块（肩肘回归、夹爪二分类、底盘五分类及转向幅度；训练和推理均为确定性 latent）。默认 **K=32、batch size=8、单车头相机、五维状态与动作**。一个样本对应一个控制时刻；一个 episode 可以提供多个样本。
 
 ```bash
 # 选择一个尚不存在的实验目录；按场景 seed 分组划分训练/验证集。

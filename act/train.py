@@ -3,7 +3,6 @@ import argparse
 from contextlib import nullcontext
 import json
 import math
-import os
 from pathlib import Path
 import platform
 import random
@@ -22,6 +21,10 @@ from .common import atomic_json, load_prepared
 from .config import config_from_dict, load_config
 from .dataset import EpisodeDataset
 from .model import ACT
+from .metrics import MotionMetrics
+from .action_codec import CONTRACT
+from .checkpoint import load_checkpoint, save_checkpoint, normalized_prediction
+from .losses import hybrid_loss, training_class_balance, LossAverages
 
 
 def masked_l1(prediction, target, is_pad):
@@ -33,28 +36,29 @@ def masked_l1(prediction, target, is_pad):
     return torch.where(valid, (prediction - target).abs(), 0).sum() / count
 
 
-def act_loss(prediction, target, is_pad, mu, logvar, beta):
-    l1 = masked_l1(prediction, target, is_pad)
-    kl = -0.5 * (1 + logvar - mu.square() - logvar.exp()).sum(-1).mean()
-    return l1 + beta * kl, l1, kl
-
-
 def move_batch(batch, device):
     return {key: value.to(device, non_blocking=True) for key, value in batch.items()}
 
 
 @torch.no_grad()
-def validate(model, loader, device, stats, progress="auto", description="Validation", train_loss=None):
+def validate(model, loader, device, stats, progress="auto", description="Validation", train_loss=None, base_weights=None):
     model.eval()
     error = torch.zeros(model.cfg.action_dim, device=device, dtype=torch.float64)
     first_error = torch.zeros_like(error)
     count = first_count = correct_gripper = 0
     std = torch.as_tensor(stats["action_std"], device=device)
     mean = torch.as_tensor(stats["action_mean"], device=device)
+    state_std = torch.as_tensor(stats["state_std"], device=device)
+    state_mean = torch.as_tensor(stats["state_mean"], device=device)
+    motion = MotionMetrics(device)
+    losses = LossAverages()
     with BatchProgress(len(loader), description, progress) as batches:
         for batch in loader:
             batch = move_batch(batch, device)
-            prediction, _, _ = model(batch["images"], batch["state"])  # Prior mean, no expert actions.
+            output = model(batch["images"], batch["state"])
+            _, parts, counts = hybrid_loss(output, batch["actions"], batch["is_pad"], stats, base_weights)
+            losses.update(parts, counts)
+            prediction = normalized_prediction(output, stats)
             if not torch.isfinite(prediction).all():
                 raise FloatingPointError("Nonfinite validation prediction")
             valid = ~batch["is_pad"]
@@ -66,13 +70,15 @@ def validate(model, loader, device, stats, progress="auto", description="Validat
             pred_g = prediction[:, :, 2] * std[2] + mean[2]
             target_g = batch["actions"][:, :, 2] * std[2] + mean[2]
             correct_gripper += int((((pred_g >= .5) == (target_g >= .5)) & valid).sum())
-            batches.advance(train_loss=train_loss, val_loss=float((error / count).mean()))
+            motion.update(prediction * std + mean, batch["actions"] * std + mean,
+                          batch["is_pad"], batch["state"] * state_std + state_mean)
+            batches.advance(train_loss=train_loss, val_loss=losses.result("val")["val_loss"])
     if count == 0:
         raise ValueError("Empty validation loader")
-    return {"val_l1_z0": float((error / count).mean()),
+    return {"val_l1": float((error / count).mean()),
             "val_mae_physical": (error / count * std).cpu().tolist(),
             "val_first_mae_physical": (first_error / first_count * std).cpu().tolist(),
-            "val_gripper_accuracy": correct_gripper / count}
+            "val_gripper_accuracy": correct_gripper / count, **losses.result("val"), **motion.result()}
 
 
 class BatchProgress:
@@ -114,8 +120,8 @@ def print_epoch_summary(metrics, epochs, best, best_epoch, stale, cfg, improved)
     print(f"\n第 {metrics['epoch'] + 1}/{epochs} 轮 | {metrics['elapsed_seconds']:.1f} 秒 | "
           f"累计更新 {metrics['global_step']:,} 次", flush=True)
     print(f"  训练总 loss={metrics['train_loss']:.4f} | 训练动作 L1={metrics['train_l1']:.4f} | "
-          f"KL={metrics['train_kl']:.4f} | "
-          f"验证动作 L1(z=0)={metrics['val_l1_z0']:.4f}（越低越好）", flush=True)
+          f"验证混合损失={metrics['val_loss']:.4f} | "
+          f"验证动作 L1={metrics['val_l1']:.4f}", flush=True)
     values = metrics.get("val_mae_physical")
     if values is None:
         print("  验证 MAE：未提供", flush=True)
@@ -125,30 +131,28 @@ def print_epoch_summary(metrics, epochs, best, best_epoch, stale, cfg, improved)
     accuracy = metrics.get("val_gripper_accuracy")
     accuracy_text = "未提供" if accuracy is None else f"{accuracy:.1%}"
     print(f"  夹爪开闭准确率={accuracy_text} | "
-          f"最佳验证 L1={best:.4f}（第 {best_epoch + 1} 轮） | "
+          f"最佳验证混合损失={best:.4f}（第 {best_epoch + 1} 轮） | "
           f"{'已更新 best.pt；' if improved else ''}已保存 last.pt", flush=True)
+    recall = metrics.get("val_first_turn_recall")
+    if recall is not None:
+        start = metrics.get("val_first_turn_start_recall")
+        start_text = "无样本" if start is None else f"{start:.1%}"
+        print(f"  首步转向召回={recall:.1%} | 从静止启动转向={start_text} | "
+              f"零转向基线 MAE={metrics['val_zero_turn_mae']:.4f} rad/s", flush=True)
+        stop = metrics.get("val_first_turn_stop_recall")
+        false_positive = metrics.get("val_first_turn_false_positive_rate")
+        stop_text = "无样本" if stop is None else f"{stop:.1%}"
+        false_text = "无样本" if false_positive is None else f"{false_positive:.1%}"
+        print(f"  首步停止转向召回={stop_text} | 首步误转向率={false_text}", flush=True)
+        left = metrics.get("val_first_turn_left_start_recall")
+        right = metrics.get("val_first_turn_right_start_recall")
+        left_text = "无样本" if left is None else f"{left:.1%}"
+        right_text = "无样本" if right is None else f"{right:.1%}"
+        print(f"  启动左转召回={left_text} | 启动右转召回={right_text}", flush=True)
+        if recall < .2:
+            print("  注意：转向召回低，整体 L1 不能证明模型会导航；请先检查分动作指标和闭环表现。", flush=True)
     if cfg.training.patience:
         print(f"  早停计数={stale}/{cfg.training.patience}（有效改善需超过 {cfg.training.min_delta:g}）", flush=True)
-
-
-def save_checkpoint(path, checkpoint):
-    path = Path(path)
-    temporary = path.with_suffix(".tmp")
-    try:
-        with temporary.open("wb") as stream:
-            torch.save(checkpoint, stream)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def load_checkpoint(path):
-    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
-    if checkpoint.get("format_version") != 1:
-        raise ValueError("Unsupported checkpoint format")
-    return checkpoint
 
 
 def rng_state(generator):
@@ -199,7 +203,7 @@ def _train(root, experiment, epochs, cfg, device, resume, backbone_weights, prog
     last = experiment / "last.pt"
     checkpoint = load_checkpoint(last) if resume else None
     if resume:
-        if cfg is not None and cfg.to_dict() != checkpoint["config"]:
+        if cfg is not None and cfg.to_dict() != config_from_dict(checkpoint["config"]).to_dict():
             raise ValueError("Resume configuration differs from checkpoint; start a new experiment")
         if backbone_weights:
             raise ValueError("Resume restores all weights; do not pass ImageNet weights")
@@ -223,6 +227,12 @@ def _train(root, experiment, epochs, cfg, device, resume, backbone_weights, prog
     generator = torch.Generator().manual_seed(cfg.training.seed)
     datasets = {part: EpisodeDataset(root, [e for e in manifest["episodes"] if e["episode_id"] in splits[part]], stats, cfg.model)
                 for part in ("train", "val")}
+    balance = training_class_balance(datasets["train"])
+    # Validate held-out command support too, without using its counts for weights.
+    training_class_balance(datasets["val"])
+    if resume and checkpoint["class_balance"] != balance:
+        raise ValueError("Resume class statistics differ from checkpoint")
+    atomic_json(experiment / "class_balance.json", balance)
     loaders = {part: DataLoader(dataset, batch_size=cfg.training.batch_size, shuffle=part == "train",
                                num_workers=cfg.training.num_workers, drop_last=False,
                                pin_memory=device.type == "cuda", generator=generator)
@@ -243,7 +253,7 @@ def _train(root, experiment, epochs, cfg, device, resume, backbone_weights, prog
         if checkpoint["scaler"]:
             scaler.load_state_dict(checkpoint["scaler"])
         start_epoch, step = checkpoint["epoch"] + 1, checkpoint["global_step"]
-        best, best_epoch = checkpoint["best_val_l1"], checkpoint["best_epoch"]
+        best, best_epoch = checkpoint["best_val_loss"], checkpoint["best_epoch"]
         early_best, stale = checkpoint["early_best"], checkpoint["stale_epochs"]
         restore_rng(checkpoint["rng"], generator)
         # Recover best.pt if publication was interrupted after last.pt committed.
@@ -278,22 +288,28 @@ def _train(root, experiment, epochs, cfg, device, resume, backbone_weights, prog
           f"验证：{len(splits['val'])} 条轨迹 / {len(datasets['val']):,} 个样本\n"
           f"每轮更新 {len(loaders['train']):,} 次 | batch={cfg.training.batch_size} | "
           f"K={cfg.model.chunk_size} | 从第 {start_epoch + 1} 轮训练到第 {epochs} 轮", flush=True)
-    print("进度条显示本阶段已完成的 batch；train_loss=L1+KL权重×KL，val_loss=验证动作L1(z=0)。\n"
-          "pending 表示本轮尚未验证；验证阶段同时显示本轮训练 loss 和累计验证 loss。\n"
-          "训练总 loss 与验证动作 L1 的定义不同；验证结束后显示物理单位 MAE。\n"
-          "验证误差不等于仿真成功率。完整数值写入 metrics.jsonl（epoch 从 0 开始）。", flush=True)
+    print(f"底盘类别：{balance['base_modes']} | 有效 chunk 标签数：{balance['counts']}\n"
+          f"自动类别权重：{balance['weights']}", flush=True)
+    print("每轮均匀遍历训练起点；四头损失直接相加；训练/推理均为确定性 latent，无 KL。\n"
+          "val_loss 为混合验证损失，用于 best.pt 和早停；L1 与逐类指标用于诊断。\n"
+          "离线损失不等于仿真成功率。metrics.jsonl 的 epoch 从 0 开始。", flush=True)
     for epoch in range(start_epoch, epochs):
         started = time.monotonic()
         model.train()
-        action_total = action_count = kl_total = sample_count = 0.0
+        action_total = action_count = 0.0
+        losses = LossAverages()
         with BatchProgress(len(loaders["train"]), f"Train {epoch + 1:02d}/{epochs}", progress) as batches:
             for batch in loaders["train"]:
                 batch = move_batch(batch, device)
                 optimizer.zero_grad(set_to_none=True)
                 context = torch.autocast(device_type="cuda", dtype=torch.float16) if amp else nullcontext()
                 with context:
-                    prediction, mu, logvar = model(batch["images"], batch["state"], batch["actions"], batch["is_pad"])
-                    loss, l1, kl = act_loss(prediction.float(), batch["actions"], batch["is_pad"], mu.float(), logvar.float(), cfg.training.kl_weight)
+                    output = model(batch["images"], batch["state"])
+                    loss, parts, counts = hybrid_loss(output, batch["actions"], batch["is_pad"],
+                                                       stats, balance["weights"])
+                with torch.no_grad():
+                    prediction = normalized_prediction(output, stats)
+                    l1 = masked_l1(prediction, batch["actions"], batch["is_pad"])
                 if not torch.isfinite(loss):
                     raise FloatingPointError("Nonfinite training loss")
                 scaler.scale(loss).backward()
@@ -302,23 +318,21 @@ def _train(root, experiment, epochs, cfg, device, resume, backbone_weights, prog
                 scaler.step(optimizer)
                 scaler.update()
                 step += 1
-                valid_elements = int((~batch["is_pad"]).sum()) * cfg.model.action_dim
-                n = batch["state"].shape[0]
-                action_total += float(l1.detach()) * valid_elements
+                valid_elements = counts["valid"] * cfg.model.action_dim
+                action_total += float(l1) * valid_elements
                 action_count += valid_elements
-                kl_total += float(kl.detach()) * n
-                sample_count += n
-                running_l1 = action_total / action_count
-                running_kl = kl_total / sample_count
-                batches.advance(train_loss=running_l1 + cfg.training.kl_weight * running_kl,
-                                train_L1=running_l1, val_loss=None)
-        train_loss = action_total / action_count + cfg.training.kl_weight * kl_total / sample_count
+                losses.update(parts, counts)
+                batches.advance(train_loss=losses.result("train")["train_loss"],
+                                train_L1=action_total / action_count, val_loss=None)
+        train_metrics = losses.result("train")
         metrics = {"epoch": epoch, "global_step": step, "train_l1": action_total / action_count,
-                   "train_kl": kl_total / sample_count, "train_loss": train_loss,
+                   **train_metrics,
                    **validate(model, loaders["val"], device, stats, progress,
-                              f"Valid {epoch + 1:02d}/{epochs}", train_loss),
+                              f"Valid {epoch + 1:02d}/{epochs}", train_metrics["train_loss"], balance["weights"]),
                    "elapsed_seconds": time.monotonic() - started}
-        score = metrics["val_l1_z0"]
+        score = metrics["val_loss"]
+        if not math.isfinite(score):
+            raise FloatingPointError("Nonfinite validation loss")
         improved = score < best
         if improved:
             best, best_epoch = score, epoch
@@ -326,10 +340,10 @@ def _train(root, experiment, epochs, cfg, device, resume, backbone_weights, prog
             early_best, stale = score, 0
         else:
             stale += 1
-        checkpoint = {"format_version": 1, "model": model.state_dict(), "optimizer": optimizer.state_dict(),
+        checkpoint = {"format_version": 2, "action_codec": CONTRACT, "class_balance": balance, "model": model.state_dict(), "optimizer": optimizer.state_dict(),
                       "scaler": scaler.state_dict(), "config": cfg.to_dict(), "schema": manifest["schema"],
                       "stats": stats, "prepared": prepared, "epoch": epoch, "global_step": step,
-                      "best_val_l1": best, "best_epoch": best_epoch, "early_best": early_best,
+                      "best_val_loss": best, "selection_metric": "val_loss", "best_epoch": best_epoch, "early_best": early_best,
                       "stale_epochs": stale, "rng": rng_state(generator), "metrics": metrics, "versions": versions}
         print(f"第 {epoch + 1} 轮验证完成，正在保存 {'last.pt 和 best.pt' if improved else 'last.pt'}…", flush=True)
         save_checkpoint(last, checkpoint)

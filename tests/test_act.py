@@ -14,7 +14,9 @@ from act.model import ACT
 from act.policy import ACTPolicy, TemporalEnsembler
 from act.prepare import choose_splits, prepare
 from act.rollout import SimActionAdapter
-from act.train import act_loss, load_checkpoint, masked_l1, save_checkpoint, train
+from act.train import load_checkpoint, masked_l1, save_checkpoint, train
+from act.losses import hybrid_loss
+from act.checkpoint import normalized_prediction
 from recorder import dataset_schema
 
 
@@ -55,8 +57,8 @@ def dataset_root(tmp_path):
 
 
 def tiny_config():
-    return Config(ModelConfig(hidden_dim=16, nheads=4, latent_dim=4, dim_feedforward=32,
-                              encoder_layers=1, decoder_layers=1, posterior_layers=1,
+    return Config(ModelConfig(hidden_dim=16, nheads=4, dim_feedforward=32,
+                              encoder_layers=1, decoder_layers=1,
                               dropout=0, pretrained_backbone=False), TrainConfig(batch_size=8))
 
 
@@ -112,40 +114,39 @@ def test_sample_alignment_and_padding(dataset_root, tmp_path):
     assert data[3]["state"][0] > 100
 
 
-def test_network_backward_mask_and_prior():
-    cfg = tiny_config().model
-    model = ACT(cfg)
+def test_hybrid_network_gradients_and_deterministic_inference():
+    model = ACT(tiny_config().model).eval()
     pixels = torch.rand(2, 1, 3, 240, 320)
     state = torch.zeros(2, 5)
-    actions = torch.randn(2, 32, 5)
+    actions = torch.zeros(2, 32, 5)
+    actions[0, :3, 4] = 1
+    actions[1, :3, 4] = -.7
+    actions[1, :3, 2] = 1
     pad = torch.arange(32).expand(2, -1) >= 3
-    model.eval()
-    _, mu, logvar = model(pixels, state, actions, pad)
-    changed = actions.clone()
-    changed[pad] = 10000
-    _, mu2, logvar2 = model(pixels, state, changed, pad)
-    torch.testing.assert_close(mu, mu2)
-    torch.testing.assert_close(logvar, logvar2)
-    prior, _, _ = model(pixels, state)
-    torch.testing.assert_close(prior, model(pixels, state)[0])
-    prediction, mu, logvar = model(pixels, state, actions, pad)
-    loss, _, _ = act_loss(prediction, actions, pad, mu, logvar, 10)
+    stats = {'action_mean': [0.] * 5, 'action_std': [1.] * 5}
+    output = model(pixels, state)
+    repeat = model(pixels, state)
+    for key in output:
+        torch.testing.assert_close(output[key], repeat[key])
+    loss, _, _ = hybrid_loss(output, actions, pad, stats, [1.] * 5)
     loss.backward()
-    assert torch.isfinite(loss)
-    assert model.action_head.weight.grad.abs().sum() > 0
-    assert model.backbone[0].weight.grad.abs().sum() > 0
-    assert model.posterior_head.weight.grad.abs().sum() > 0
-    # One valid action with unit errors stays L1=1 regardless of padding length.
+    for layer in (model.arm_head, model.gripper_head, model.base_head, model.turn_head, model.backbone[0]):
+        assert layer.weight.grad.abs().sum() > 0
+    assert not any('posterior' in name for name, _ in model.named_parameters())
+    assert normalized_prediction(output, stats).shape == (2, 32, 5)
     assert masked_l1(torch.ones(1, 32, 5), torch.zeros(1, 32, 5),
                      torch.arange(32)[None] > 0).item() == 1
 
 
-def test_train_resume_and_standalone_policy(dataset_root, tmp_path, monkeypatch):
+def test_train_resume_and_standalone_policy(dataset_root, tmp_path, monkeypatch, capsys):
     cfg = tiny_config()
     full, resumed = tmp_path / "full", tmp_path / "resumed"
     prepared(dataset_root, full)
     prepared(dataset_root, resumed)
-    train(dataset_root, full, epochs=2, cfg=cfg, device="cpu")
+    train(dataset_root, full, epochs=2, cfg=cfg, device="cpu", progress="always")
+    terminal = capsys.readouterr().out
+    assert "train_loss=" in terminal and "val_loss=" in terminal and "pending" in terminal
+    assert "100%" in terminal and "验证动作 L1" in terminal
     train(dataset_root, resumed, epochs=1, cfg=cfg, device="cpu")
     train(dataset_root, resumed, epochs=2, device="cpu", resume=True)
     a, b = load_checkpoint(full / "last.pt"), load_checkpoint(resumed / "last.pt")
@@ -155,6 +156,10 @@ def test_train_resume_and_standalone_policy(dataset_root, tmp_path, monkeypatch)
     rows = [json.loads(line) for line in (resumed / "metrics.jsonl").read_text().splitlines()]
     assert [r["epoch"] for r in rows] == [0, 1]
     assert len(rows[0]["val_mae_physical"]) == 5
+    assert rows[0]["train_loss"] == pytest.approx(sum(rows[0][f'train_{k}'] for k in
+        ('arm_l1', 'gripper_ce', 'base_ce', 'turn_l1')))
+    assert a['format_version'] == 2 and a['selection_metric'] == 'val_loss'
+    assert a['class_balance']['counts'] == [6, 0, 0, 0, 0]
     with pytest.raises(FileExistsError):
         train(dataset_root, resumed, epochs=2, cfg=cfg)
     # Simulate deployment with just a single checkpoint, no source dataset or files.
@@ -169,6 +174,11 @@ def test_train_resume_and_standalone_policy(dataset_root, tmp_path, monkeypatch)
     policy = ACTPolicy(checkpoint_path)
     action = policy.act(np.zeros((1, 240, 320, 3), np.uint8), np.zeros(5, np.float32))
     assert action.shape == (5,) and np.isfinite(action).all()
+    from act.eval_turn import evaluate as evaluate_turn
+    report = evaluate_turn(checkpoint_path, dataset_root, tmp_path / 'turn-report',
+                           splits_path=resumed / 'splits.json')
+    assert report['original_data_hashes_verified']
+    assert (tmp_path / 'turn-report' / 'frames.csv').is_file()
     from act.rollout import evaluate
     results = evaluate(checkpoint_path, [987654], tmp_path / "rollout", max_steps=2, video=True)
     assert results[0]["control_steps"] == 2
@@ -191,7 +201,10 @@ def test_early_stopping_preserves_best_checkpoint(dataset_root, tmp_path, monkey
     experiment = tmp_path / "early-stop"
     prepared(dataset_root, experiment)
     scores = iter([.2, .3])
-    monkeypatch.setattr(training, "validate", lambda *args: {"val_l1_z0": next(scores)})
+    l1_scores = iter([.9, .1])  # L1 improves while the actual selection objective worsens.
+    monkeypatch.setattr(training, "validate", lambda *args: {
+        "val_loss": next(scores), "val_l1": next(l1_scores), "val_mae_physical": [0.] * 5,
+        "val_gripper_accuracy": 1., "val_first_mae_physical": [0.] * 5})
     train(dataset_root, experiment, epochs=9, cfg=cfg, device="cpu")
     assert load_checkpoint(experiment / "best.pt")["epoch"] == 0
     assert load_checkpoint(experiment / "last.pt")["epoch"] == 1
@@ -206,6 +219,20 @@ def test_temporal_ensemble_keeps_valid_zero_actions():
     np.testing.assert_array_equal(ensemble.select(2, np.array([[8.], [0.]])), [6])
     ensemble.reset()
     np.testing.assert_array_equal(ensemble.select(0, np.zeros((2, 5))), np.zeros(5))
+
+
+def test_redirected_progress_reports_before_epoch_finishes(monkeypatch, capsys):
+    import importlib
+    training = importlib.import_module("act.train")
+    times = iter([0., 11., 12.])
+    monkeypatch.setattr(training.time, "monotonic", lambda: next(times))
+    with training.BatchProgress(2, "Train 01/2", "auto") as progress:
+        progress.advance(train_loss=.5, val_loss=None)
+        first = capsys.readouterr().out
+        assert "1/2 batch (50%)" in first and "train_loss=0.5000" in first
+        assert "val_loss=pending" in first
+        progress.advance(train_loss=.4, val_loss=None)
+        assert "2/2 batch (100%)" in capsys.readouterr().out
 
 
 def test_adapter_does_not_restart_grasp_every_tick():

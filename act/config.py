@@ -14,9 +14,7 @@ class ModelConfig:
     image_hw: tuple = (240, 320)
     chunk_size: int = 32
     hidden_dim: int = 512
-    latent_dim: int = 32
     nheads: int = 8
-    posterior_layers: int = 2
     encoder_layers: int = 4
     decoder_layers: int = 7
     dim_feedforward: int = 2048
@@ -25,12 +23,14 @@ class ModelConfig:
 
     def __post_init__(self):
         self.cameras, self.image_hw = tuple(self.cameras), tuple(self.image_hw)
-        for name in ("state_dim", "action_dim", "chunk_size", "hidden_dim", "latent_dim",
-                     "nheads", "posterior_layers", "encoder_layers", "decoder_layers", "dim_feedforward"):
+        for name in ("state_dim", "action_dim", "chunk_size", "hidden_dim",
+                     "nheads", "encoder_layers", "decoder_layers", "dim_feedforward"):
             if type(getattr(self, name)) is not int or getattr(self, name) < 1:
                 raise ValueError(f"{name} must be a positive integer")
         if self.hidden_dim % self.nheads or self.hidden_dim % 4:
             raise ValueError("hidden_dim must be divisible by nheads and by four")
+        if self.state_dim != 5 or self.action_dim != 5:
+            raise ValueError("Hybrid ACT requires five-dimensional state and action")
         if not 0 <= self.dropout < 1 or type(self.pretrained_backbone) is not bool:
             raise ValueError("Invalid dropout / pretrained_backbone")
         if not self.cameras or len(set(self.cameras)) != len(self.cameras):
@@ -45,7 +45,6 @@ class TrainConfig:
     learning_rate: float = 1e-4
     backbone_learning_rate: float = 1e-5
     weight_decay: float = 1e-4
-    kl_weight: float = 10.0
     grad_clip: float = 1.0
     seed: int = 42
     num_workers: int = 0
@@ -60,7 +59,7 @@ class TrainConfig:
         for name in ("seed", "num_workers", "patience"):
             if type(getattr(self, name)) is not int or getattr(self, name) < 0:
                 raise ValueError(f"{name} must be a nonnegative integer")
-        for name in ("learning_rate", "backbone_learning_rate", "weight_decay", "kl_weight", "grad_clip", "min_delta"):
+        for name in ("learning_rate", "backbone_learning_rate", "weight_decay", "grad_clip", "min_delta"):
             value = getattr(self, name)
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"Invalid {name}")

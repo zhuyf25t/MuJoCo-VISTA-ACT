@@ -14,10 +14,15 @@
 | `common.py` | 数据契约、相对路径、文件校验与原子保存 |
 | `prepare.py` | 冻结清单、显式划分、检查 HDF5、计算训练集统计量 |
 | `dataset.py` | 每个控制时刻构成一个样本，读取并标准化当前观测与未来动作块 |
-| `model.py` | ResNet-18、CVAE 后验、观测 Encoder、动作 Decoder |
-| `train.py` | 训练、`z=0` 验证、日志、best/last checkpoint、恢复训练 |
+| `model.py` | ResNet-18、观测 Encoder、动作 Decoder、四个动作头 |
+| `train.py` | 混合损失训练与验证、日志、best/last checkpoint、恢复训练 |
+| `metrics.py` | 转向召回、静止启动、误转向率、零转向基线与闭爪机会诊断 |
 | `policy.py` | 只凭 checkpoint 推理；可选同一执行时刻的时间集成 |
 | `rollout.py` | 五维命令逐拍执行、指定 seed 的 MuJoCo 评估 |
+| `replay.py` | 专家命令回放，区分学习误差与执行契约不一致 |
+| `eval_turn.py` | 不重新训练，独立评估 checkpoint 的左转、右转、停止和不转向 |
+| `action_codec.py` / `losses.py` | 物理单位与类别映射、自动类别权重和四头损失 |
+| `checkpoint.py` | 混合模型 checkpoint 保存、加载、格式与动作映射校验 |
 
 ## episode、样本、batch、epoch
 
@@ -32,6 +37,61 @@
 
 所有帧按同样概率采样，所以长 episode 提供更多样本。K=32 覆盖约 3.2 秒，
 但默认部署每拍重规划，只执行预测块第一拍；不会盲走 3.2 秒。
+
+## 当前网络和损失（v2）
+
+每个 Decoder 向量分别经过四个头：肩肘两个标准化角度、夹爪两个 logits、底盘五个 logits、
+一个 sigmoid 转向幅度。CNN、Encoder/Decoder 层数和 K 不变。训练与推理共用一个可学习的
+常量 latent token；不读取专家未来动作作为网络输入，不使用 CVAE 后验或 KL。
+
+底盘类别顺序固定为 stop、forward、back、left、right。forward/back 为 ±0.3 m/s，
+left/right 的角速度为 ±r×1.0 rad/s；其余对应速度为零。夹爪类别为 closed=0、open=1。
+肩肘反归一化后保持连续。最终仍输出五维目标，每个动作持续一拍，不调用 VISTA tools。
+训练前检查命令满足这些条件；不支持同时前进和转向的标签，出现此类数据会明确报错。
+
+```text
+loss = mean(肩肘标准化 L1) + mean(夹爪 CE)
+     + mean(w[class] × 底盘 CE) + mean(真实转向位置的幅度 L1)
+```
+
+四项系数固定为 1。幅度是角速度除以 1 rad/s 后的无量纲数，绝不与 m/s 共用幅度。
+幅度损失仅按真值转向位置计算，与模型是否选对类别无关；没有转向标签的 batch 此项为零。
+所有项排除 padding，交叉熵直接接 logits；argmax 只用于解码和评估。
+
+每轮均匀打乱全部训练起点，不再提供重采样/Huber 开关。类别权重自动用训练集统计：
+`w_c=N/(C_present*N_c)`。N_c 统计的是有效 chunk 位置：同一集第 t 帧的标签出现
+`min(K,t+1)` 次。验证集和 padding 不参与权重。缺失类权重为零并在统计中列出。
+CE 用有效位置数作分母，不用每个 batch 的权重和，避免稀有类权重在单类 batch 中被抵消。
+统计写入 `class_balance.json` 并存进 checkpoint，恢复时重新核对。
+
+`best.pt` 和早停使用最小 `val_loss`（同一混合目标，复用训练权重），L1 只作诊断。
+验证损失逐项累计：幅度项按真实转向数平均，其余按有效位置数平均，不受验证 batch 切分影响。
+日志报告底盘五类/夹爪两类混淆矩阵与召回、左右转启动、停止、误转向、前后行启动和开闭爪机会。
+转向正确要求方向正确且 |w|>0.2 rad/s；停止转向要求 |w|<0.05 rad/s。
+高离线指标不能替代闭环捡球、搬运、投放成功率。
+
+本分支只支持混合动作头 checkpoint，旧五维回归 checkpoint 不能训练、恢复或评估。
+请建立新实验目录；数据格式不变，可继续使用原来的 HDF5。latent_dim、posterior_layers、
+kl_weight、重采样和 Huber 配置项已删除。
+
+### 不重新训练，检查一个 checkpoint 的转向
+
+```bash
+python -m act.eval_turn --checkpoint path/to/best.pt --dataset-root data/act_v1 --output tmp/turn_eval_01
+```
+
+默认使用 CPU，并在原训练/验证集分别按每集每类最多一帧进行分层抽查。六类是启动左转、
+启动右转、继续左转、继续右转、停止转向、不应转向。`--per-category 0` 可检查所有符合
+这些条件的帧；抽查结果不能解释成全数据精度。工具验证原始 HDF5 哈希及划分哈希，不会
+把后来采集的数据混进评估。若自动重建划分不匹配，传入原来的 `--splits path/to/splits.json`。
+
+报告分别显示两组数据的各类样本数、正确率、角速度 MAE 与平均预测幅度；不把六类平均成
+一个掩盖问题的分数。它检查 z=0 时 chunk 第一拍，未使用 temporal ensembling。
+预测方向正确且幅度超过 0.2 rad/s 才算转向正确；停止要求幅度小于 0.05 rad/s。
+“正确”表示符合这个专家观测上的动作标签，不能代替真实任务成功率。
+
+输出 `report.json` 和逐帧 `frames.csv`。每次使用新输出目录。零转向策略可能停止项满分，
+但左右转项为零；持续转圈策略可能转向项不错，却停止项失败。两者都不能通过导航评估。
 
 ## 数据和跨机器迁移
 
@@ -77,8 +137,7 @@ python -m pip install -r requirements.txt
 ResNet-18 原版含分类头约 1,169 万参数；本项目移除分类头，只使用空间特征图，
 并采用 FrozenBatchNorm，骨干约 1,117 万可训练参数。FrozenBatchNorm 固定的是 BN
 统计量与仿射量，卷积权重仍参与微调；CNN 学习率为 `1e-5`，其他网络为 `1e-4`。
-ACT 的 Transformer、投影和动作头从随机初始化开始。默认配置共有
-59,853,573 个可训练参数，其中骨干 11,166,912 个；启动训练时会再次打印实际数量。
+ACT 的 Transformer、投影和动作头从随机初始化开始；启动训练时打印实际参数数量。
 
 默认调用 torchvision 的 `ResNet18_Weights.IMAGENET1K_V1`，首次初始化会从
 [PyTorch 官方地址](https://download.pytorch.org/models/resnet18-f37072fd.pth)下载 ImageNet 权重，
@@ -123,7 +182,7 @@ python -m act.train --dataset-root data/act_v1 --experiment output/act/exp_001 -
 python -m act.train --dataset-root /root/autodl-tmp/act_v1 --experiment output/act/exp_001 --resume --epochs 150 --device cuda
 ```
 
-`--epochs` 必须显式提供，表示总训练遍数。默认单进程读取、FP32；需要时在配置中开启
+`--epochs` 必须显式提供，表示总训练遍数。baseline.yaml 使用 8 个数据加载 worker、FP32；可在配置中修改
 `num_workers` 或 CUDA `amp`。这些设置会保存在实验中，恢复时不允许默默修改。
 模型、优化器、梯度缩放器、随机数及采样生成器状态均保存。按完整 epoch 恢复；
 中途被杀会重跑尚未保存的 epoch。相同软件/硬件上的 CPU 恢复可验证一致性，
@@ -136,26 +195,18 @@ Train 01/100: ... train_loss=..., train_L1=..., val_loss=pending
 Valid 01/100: ... train_loss=..., val_loss=...
 ```
 
-进度条显示 batch 完成比例、耗时和预计剩余时间。训练阶段的验证值为 `pending`；验证开始后保留本轮训练 loss，同时更新 `val_loss`，其含义为 `val_l1_z0`。训练总 loss 含 KL 项，不能与验证 loss 直接比较数值大小。
+进度条显示 batch 完成比例、耗时和 ETA。train_loss/val_loss 均报告四头混合损失，
+训练期间验证值为 pending。`--progress auto` 在终端显示动态条，重定向时约每 10 秒在
+batch 完成后输出进展；always 强制条，never 只输出阶段和每轮摘要。
 
-`--progress auto` 默认在交互终端显示动态条，重定向日志时约每 10 秒在下一个 batch 完成后输出进展；`always` 强制动态条，`never` 保留阶段提示和每轮摘要。每轮结束打印中文误差摘要，完整指标写入 `metrics.jsonl`：
-
-| 指标 | 含义 |
-| --- | --- |
-| `train_loss` | 训练总损失：`train_l1 + kl_weight × train_kl` |
-| `train_l1` | 训练时使用后验 z 的动作误差，只统计有效动作元素 |
-| `train_kl` | CVAE 后验与标准正态先验的 KL |
-| `val_l1_z0` | 验证时不读取专家动作，用 z=0 预测的标准化动作误差，越低越好 |
-| `val_mae_physical` | 五维动作的物理单位 MAE，顺序与 schema 一致 |
-| `val_first_mae_physical` | 只检查每次预测第一拍，更直接对应逐拍重规划 |
-| `val_gripper_accuracy` | 原始物理标度下按 0.5 阈值的开闭准确率 |
-
-训练与验证使用不同 z，不能直接用两者差值诊断过拟合。动作块误差也不等于任务成功率。
-连续帧高度相关；验证只有少数 episode 时，结果波动不能当作稳定的泛化结论。
+`metrics.jsonl` 保存 train/val 的 arm_l1、gripper_ce、base_ce、turn_l1、总 loss；
+`train_l1` 和 `val_l1` 为解码后五维标准化 L1。
+还有 `val_mae_physical`、`val_first_mae_physical`、底盘/夹爪逐类指标和动作切换指标。
+训练有 dropout 且参数持续更新，验证为 eval 模式，不能单凭一个小差值断言过拟合。
 
 停止有两种机制：显式 epoch 上限；或配置 `patience>0` 后，连续该数量的 epoch
 没有超过 `min_delta` 的验证改善时提前停止。默认 `patience=0`，即关闭早停。
-`best.pt` 总是跟踪最小 `val_l1_z0`，不受 `min_delta` 阈值影响。已经早停的实验
+`best.pt` 总是跟踪最小 `val_loss`，不受 `min_delta` 阈值影响。已经早停的实验
 不能通过恢复偷偷重置耐心值；更改停止策略应建立新实验。
 
 先观察小数据能否拟合、各动作维度是否正常，再在独立 MuJoCo 验证 seed 上比较少量候选。
@@ -170,6 +221,7 @@ output/act/exp_001/
   stats.json      训练集归一化统计
   prepared.json   清单、统计、划分和 HDF5 的哈希及样本数量
   config.yaml    实际训练配置
+  class_balance.json  仅训练集有效 chunk 位置的类别数与自动权重
   runtime.json   运行设备、依赖/Git 版本、目标 epoch、每 epoch 更新次数
   metrics.jsonl  各 epoch 的指标（epoch 字段从 0 开始）
   best.pt        离线验证指标最好的完整 checkpoint
@@ -237,25 +289,49 @@ python -m act.rollout --checkpoint output/act/exp_001/best.pt --seeds 1000 --out
 | 设置 | 执行方式 |
 | --- | --- |
 | 不传 `--ensemble-coefficient` | 关闭集成，每拍重新预测，执行最新动作块的第一拍 |
-| `--ensemble-coefficient 0` | 对覆盖同一执行时刻的候选动作等权平均 |
+| `--ensemble-coefficient 0` | 对覆盖同一执行时刻的候选预测等权融合 |
 | `--ensemble-coefficient 0.01` | 按旧到新顺序 `i=0,1,...` 使用 `exp(-m*i)` 权重，正系数偏向较旧预测 |
 
-集成组合的是不同预测块中指向同一时刻的动作，最多涉及 K 个块。它可能平滑动作，也可能延迟状态切换；比较时固定 checkpoint 和验证 seeds，并使用不同输出目录。
+v2 集成先平均分类概率，再 argmax；肩肘平均连续目标，转向幅度按选中方向的概率加权平均。
+不会直接平均左右转的有符号速度。
+集成组合的是不同预测块中指向同一时刻的预测，最多涉及 K 个块。它可能平滑动作，也可能延迟状态切换；比较时固定 checkpoint 和验证 seeds，并使用不同输出目录。
 
 ### 动作适配约定
 
-预测反归一化后，由 `SimActionAdapter` 执行关节范围和目标变化速率限制、夹爪 0.4/0.6 滞回以及底盘执行器限幅。夹爪从开到闭的命令变化开启一次 1.2 秒抓取判定，持续闭合不重新计时；重新触发需要先开再闭。
+预测反归一化后，由 `SimActionAdapter` 执行关节范围限制、夹爪 0.4/0.6 滞回以及底盘执行器限幅。
+关节标签已经是专家每拍施加的目标，不再对目标变化重复限速，也不提供额外限速或开环执行跨度参数。
+每拍重新推理；关节范围和底盘执行器限幅仍有效。此处是仿真执行约定，不是实机安全控制器。
+夹爪从开到闭的命令变化开启一次 1.2 秒抓取判定，持续闭合不重新计时；重新触发需要先开再闭。
 
 五维动作无法表示专家连续两次 `close_gripper` 的高层调用边界。因此，适配器与 VISTA 原语的重复抓取语义存在差异。分析抓取失败时，应同时检查预测动作、阈值转换和执行回执，不能仅用动作 L1 判断控制语义是否一致。
+
+### 训练前先检查专家动作能否回放
+
+```bash
+python -m act.replay --seeds 0 1 3 5 13 17 25 --modes direct recorded-events --output tmp/expert_replay.json
+```
+
+加 `--dataset-root data/act_v1` 可直接回放训练 HDF5 的实际精度；工具会先核对 seed、
+source_uid 和逐帧内容，防止误把并发采集时的 episode 编号当成 seed。
+
+输出路径必须尚不存在。`direct` 直接施加每拍关节目标；
+`recorded-events` 在 direct 基础上恢复 VISTA 日志里的开闭爪调用与结束边界。后一种模式使用专家
+未来信息，只用于定位缺失的控制语义，绝不是策略成功率。报告逐维状态/动作误差与最终成功，
+并记录来源文件哈希。原始数据包含程序收尾，回放不会重复追加收尾。
+
+若 direct 回放不能复现成功，但 recorded-events 可以，应先修复采集与部署的控制契约，
+而不是归咎于模型或继续扩充同一种数据。旧五维文件没有编码重复闭爪事件；补回事件需要新的
+明确版本与策略输出，或者把专家与学生统一到只由五维目标触发的同一个控制器。不要只延长
+学生的抓取窗口就宣称契约已一致，也不要在训练时把删除的帧拼接成仍然等间隔的序列。
 
 ## 测试与参考
 
 ```bash
-python -m pytest tests/test_act.py -q
+python -m pytest tests/test_act.py tests/test_act_hybrid.py tests/test_act_motion_metrics.py tests/test_act_eval_turn.py -q
 ```
 
-测试覆盖样本对齐、padding 与损失屏蔽、场景隔离、训练集统计、路径迁移、文件哈希、CVAE 梯度、z=0 推理、训练恢复、早停、时间集成及 MuJoCo 录像。合成数据测试用于检查实现行为，任务表现由独立场景评估。
+测试覆盖样本对齐、padding 与损失屏蔽、场景隔离、训练集统计、路径迁移、文件哈希、四头梯度、类别权重、确定性推理、checkpoint 格式校验、训练恢复、早停、时间集成及 MuJoCo 录像。合成数据测试用于检查实现行为，任务表现由独立场景评估。
 
-网络保留 ACT 的 CVAE、动作分块和 Transformer 结构，并采用本项目的后验层数、相机/类型嵌入和有效元素损失归一化约定。结构与数据契约以本项目源码为准。
+网络保留 ACT 的动作分块和视觉 Transformer，改用分类与连续回归混合头；当前版本关闭 CVAE。结构与数据契约以本项目源码为准。
 
 参考：[ACT 原实现](https://github.com/tonyzhaozh/act)、[torchvision ResNet-18](https://docs.pytorch.org/vision/0.25/models/generated/torchvision.models.resnet18.html)、[PyTorch 安装版本](https://pytorch.org/get-started/previous-versions/)。

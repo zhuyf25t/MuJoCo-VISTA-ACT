@@ -2,11 +2,9 @@
 import numpy as np
 import torch
 
-from .common import validate_schema, validate_stats
-from .config import config_from_dict
+from .action_codec import pack_heads, decode_packet
+from .checkpoint import load_checkpoint, model_from_checkpoint, normalized_prediction
 from .dataset import image_tensor
-from .model import ACT
-from .train import load_checkpoint
 
 
 class TemporalEnsembler:
@@ -36,14 +34,8 @@ class TemporalEnsembler:
 class ACTPolicy:
     def __init__(self, checkpoint_path, device="cpu", ensemble_coefficient=None):
         checkpoint = load_checkpoint(checkpoint_path)
-        cfg = config_from_dict(checkpoint["config"])
-        validate_schema(checkpoint["schema"], cfg.model)
-        validate_stats(checkpoint["stats"])
         self.device = torch.device(device)
-        # All CNN weights are inside the checkpoint. Never download at inference.
-        self.model = ACT(cfg.model, initialize_backbone=False).to(self.device)
-        self.model.load_state_dict(checkpoint["model"], strict=True)
-        self.model.eval()
+        self.model = model_from_checkpoint(checkpoint, self.device)
         self.schema = checkpoint["schema"]
         self.stats = {k: np.asarray(v, np.float32) for k, v in checkpoint["stats"].items()}
         self.ensemble = TemporalEnsembler(ensemble_coefficient) if ensemble_coefficient is not None else None
@@ -55,7 +47,7 @@ class ACTPolicy:
             self.ensemble.reset()
 
     @torch.inference_mode()
-    def predict_chunk(self, images_rgb, measured_state):
+    def _predict(self, images_rgb, measured_state):
         images = np.asarray(images_rgb)
         cfg = self.model.cfg
         if images.shape != (len(cfg.cameras), *cfg.image_hw, 3):
@@ -64,15 +56,23 @@ class ACTPolicy:
         if state.shape != (cfg.state_dim,) or not np.isfinite(state).all():
             raise ValueError("Expected finite measured state")
         state = (state - self.stats["state_mean"]) / self.stats["state_std"]
-        prediction, _, _ = self.model(image_tensor(images).unsqueeze(0).to(self.device),
-                                     torch.from_numpy(state).unsqueeze(0).to(self.device))
-        chunk = prediction[0].cpu().numpy()
+        return self.model(image_tensor(images).unsqueeze(0).to(self.device),
+                          torch.from_numpy(state).unsqueeze(0).to(self.device))
+
+    @torch.inference_mode()
+    def predict_chunk(self, images_rgb, measured_state):
+        output = self._predict(images_rgb, measured_state)
+        chunk = normalized_prediction(output, self.stats)[0].cpu().numpy()
         if not np.isfinite(chunk).all():
             raise FloatingPointError("Nonfinite policy output")
-        return chunk  # Normalized; ensemble before conversion to physical units.
+        return chunk
 
+    @torch.inference_mode()
     def act(self, images_rgb, measured_state):
-        chunk = self.predict_chunk(images_rgb, measured_state)
-        action = self.ensemble.select(self.step, chunk) if self.ensemble else chunk[0]
+        output = self._predict(images_rgb, measured_state)
+        chunk = pack_heads(output)[0].cpu().numpy()
+        if not np.isfinite(chunk).all():
+            raise FloatingPointError("Nonfinite policy output")
+        selected = self.ensemble.select(self.step, chunk) if self.ensemble else chunk[0]
         self.step += 1
-        return action * self.stats["action_std"] + self.stats["action_mean"]
+        return decode_packet(torch.from_numpy(selected), self.stats).numpy()

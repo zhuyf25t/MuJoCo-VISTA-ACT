@@ -19,10 +19,10 @@ class SimActionAdapter:
     high-level close command with an unchanged target; see README before judging
     rollout differences from the VISTA expert.
     """
-    def __init__(self, robot, dt=0.1, close_seconds=1.2, arm_speed_limit=3.0):
-        if not all(np.isfinite(x) and x > 0 for x in (dt, close_seconds, arm_speed_limit)):
+    def __init__(self, robot, dt=0.1, close_seconds=1.2):
+        if not all(np.isfinite(x) and x > 0 for x in (dt, close_seconds)):
             raise ValueError("Adapter timing/rate limits must be positive")
-        self.robot, self.dt, self.arm_speed_limit = robot, dt, arm_speed_limit
+        self.robot, self.dt = robot, dt
         current = np.asarray(robot.applied_action, dtype=float)
         if current.shape != (5,) or not np.isfinite(current).all():
             raise ValueError("Need the known current actuator targets")
@@ -37,8 +37,7 @@ class SimActionAdapter:
             raise ValueError("Expected five finite physical-unit targets")
         _, _, low, high = self.robot.arm_geometry()
         arm = np.clip(action[:2], low, high)
-        delta = self.arm_speed_limit * self.dt
-        arm = np.clip(self.arm + np.clip(arm - self.arm, -delta, delta), low, high)
+        # Execute per-tick targets directly; expert labels already include its arm ramp.
         g = float(np.clip(action[2], 0, 1))
         target = 1.0 if g >= .6 else 0.0 if g <= .4 else self.gripper
         if target != self.gripper:
@@ -147,7 +146,7 @@ def evaluate(checkpoint, seeds, output, *, device="cpu", max_steps=600, gui=Fals
                     "label": label, "checkpoint_sha256": file_digest(checkpoint), "requested_seeds": seeds,
                     "max_steps": max_steps, "ensemble_coefficient": ensemble_coefficient,
                     "grasp_attempt_seconds": config.GRIPPER_CLOSE_SECONDS, "grasp_trigger": "open_to_closed_transition",
-                    "arm_speed_limit_rad_s": 3.0,
+                    "arm_target_semantics": "direct_per_tick_target",
                     "success_rate": sum(r["success"] for r in results) / len(results), "episodes": results})
                 print(result, flush=True)
                 if stopped == "window_closed":
