@@ -48,10 +48,16 @@ class EpisodeDataset(Dataset):
             images = np.stack([f[f"observations/images/{camera}"][t] for camera in self.cfg.cameras])
             state = f["observations/state"][t]
             actions = f["action"][t:t + self.cfg.chunk_size]
+            # Supervision only: o_{t+j} classifies a_{t+j} as a switch or continuation.
+            # The policy still receives only images[t] and state[t].
+            action_states = f["observations/state"][t:t + self.cfg.chunk_size]
         state = (state - self.stats["state_mean"]) / self.stats["state_std"]
         actions = (actions - self.stats["action_mean"]) / self.stats["action_std"]
         padded = np.zeros((self.cfg.chunk_size, self.cfg.action_dim), np.float32)
         padded[:len(actions)] = actions
+        padded_states = np.zeros((self.cfg.chunk_size, self.cfg.state_dim), np.float32)
+        padded_states[:len(action_states)] = action_states
         return {"images": image_tensor(images), "state": torch.from_numpy(state),
                 "actions": torch.from_numpy(padded),
+                "action_states": torch.from_numpy(padded_states),  # Physical units, never model input.
                 "is_pad": torch.arange(self.cfg.chunk_size) >= len(actions)}

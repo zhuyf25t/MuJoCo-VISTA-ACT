@@ -1,7 +1,7 @@
 """Motion-specific validation: global MAE can hide an always-straight policy."""
 import torch
 
-from .action_codec import BASE_MODES, action_labels
+from .action_codec import BASE_MODES, action_labels, transition_masks
 
 
 class MotionMetrics:
@@ -18,9 +18,12 @@ class MotionMetrics:
         self.gripper_confusion = torch.zeros(2, 2, dtype=torch.int64, device=device)
         self.opening = torch.zeros(2, dtype=torch.int64, device=device)
         self.drive_starts = torch.zeros(2, 2, dtype=torch.int64, device=device)
+        self.base_groups = torch.zeros(5, 2, 2, dtype=torch.int64, device=device)
+        self.gripper_groups = torch.zeros(2, 2, 2, dtype=torch.int64, device=device)
+        self.amplitude = torch.zeros(8, dtype=torch.float64, device=device)
 
     @torch.no_grad()
-    def update(self, prediction, target, is_pad, state):
+    def update(self, prediction, target, is_pad, state, *, action_states, turn_magnitude):
         valid = ~is_pad
         w, wanted = prediction[..., 4], target[..., 4]
         active = valid & (wanted.abs() > .2)
@@ -51,6 +54,27 @@ class MotionMetrics:
         predicted_base, predicted_grip, _ = action_labels(prediction[valid], validate=False)
         self.base_confusion += torch.bincount(actual_base * 5 + predicted_base, minlength=25).reshape(5, 5)
         self.gripper_confusion += torch.bincount(actual_grip * 2 + predicted_grip, minlength=4).reshape(2, 2)
+        base_switch, grip_switch = transition_masks(target[valid], action_states[valid])
+        for groups, actual, predicted, switch in (
+            (self.base_groups, actual_base, predicted_base, base_switch),
+            (self.gripper_groups, actual_grip, predicted_grip, grip_switch),
+        ):
+            group_id = actual * 2 + switch.long()
+            correct_group = group_id[actual == predicted]
+            groups[..., 0] += torch.bincount(group_id, minlength=groups.shape[0] * 2).reshape(-1, 2)
+            groups[..., 1] += torch.bincount(correct_group, minlength=groups.shape[0] * 2).reshape(-1, 2)
+        # Conditional amplitude quality, independent of whether the class was correct.
+        magnitude = turn_magnitude.squeeze(-1)[valid].double()
+        wanted_magnitude = target[..., 4][valid].abs().double()
+        true_turn = actual_base >= 3
+        magnitude, wanted_magnitude = magnitude[true_turn], wanted_magnitude[true_turn]
+        slow = wanted_magnitude < 1 - 1e-5
+        square_error = (magnitude - wanted_magnitude).square()
+        maximum_error = (1 - wanted_magnitude).square()
+        self.amplitude += torch.stack((true_turn.sum(), square_error.sum(), maximum_error.sum(),
+            slow.sum(), square_error[slow].sum(), maximum_error[slow].sum(),
+            (magnitude[slow].clamp(0, 1) - wanted_magnitude[slow]).abs().sum(),
+            ((magnitude < 0) | (magnitude > 1)).sum())).double()
         first_valid = valid[:, 0]
         wanted_base, _, _ = action_labels(target[:, 0], validate=False)
         got_base, _, _ = action_labels(prediction[:, 0], validate=False)
@@ -104,4 +128,25 @@ class MotionMetrics:
         for name, (count, correct) in zip(("forward", "back"), self.drive_starts.cpu().tolist()):
             result[f"val_first_{name}_start_count"] = count
             result[f"val_first_{name}_start_recall"] = correct / count if count else None
+        for prefix, matrix, names in (("base", self.base_groups, BASE_MODES),
+                                      ("gripper", self.gripper_groups, ("closed", "open"))):
+            rows = matrix.cpu().tolist()
+            result[f"val_{prefix}_groups"] = {
+                name: {group: {"count": count, "correct": correct,
+                               "recall": correct / count if count else None}
+                       for group, (count, correct) in zip(("ordinary", "switch"), row)}
+                for name, row in zip(names, rows)}
+            for group_index, group in enumerate(("ordinary", "switch")):
+                count, correct = matrix[:, group_index].sum(0).cpu().tolist()
+                result[f"val_{prefix}_{group}_accuracy"] = correct / count if count else None
+        n, mse, baseline, slow_n, slow_mse, slow_baseline, slow_mae, outside = self.amplitude.cpu().tolist()
+        result.update({
+            "val_turn_amplitude_mse": mse / n if n else None,
+            "val_turn_max_baseline_mse": baseline / n if n else None,
+            "val_turn_amplitude_out_of_range_rate": outside / n if n else None,
+            "val_slow_turn_count": int(slow_n),
+            "val_slow_turn_amplitude_mse": slow_mse / slow_n if slow_n else None,
+            "val_slow_turn_max_baseline_mse": slow_baseline / slow_n if slow_n else None,
+            "val_slow_turn_amplitude_mae": slow_mae / slow_n if slow_n else None,
+        })
         return result

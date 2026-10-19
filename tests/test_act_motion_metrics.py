@@ -4,12 +4,18 @@ import torch
 from act.metrics import MotionMetrics
 
 
+def update(metrics, prediction, target, is_pad, state):
+    metrics.update(prediction, target, is_pad, state,
+                   action_states=state[:, None].expand_as(target),
+                   turn_magnitude=prediction[..., 4:5].abs())
+
+
 def test_zero_policy_has_low_global_error_but_no_turn_recall():
     target = torch.zeros(1, 100, 5)
     target[0, 0, 4], target[0, 1, 4] = 1, -1
     pred = torch.zeros_like(target)
     metrics = MotionMetrics('cpu')
-    metrics.update(pred, target, torch.zeros(1, 100, dtype=torch.bool), torch.zeros(1, 5))
+    update(metrics, pred, target, torch.zeros(1, 100, dtype=torch.bool), torch.zeros(1, 5))
     result = metrics.result()
     assert result['val_zero_turn_mae'] == pytest.approx(.02)
     assert result['val_turn_recall'] == 0
@@ -28,7 +34,7 @@ def test_wrong_direction_padding_and_close_transition_are_distinguished():
     state[:, 2] = 1
     state[1, 4] = -.5  # Already turning; only sample 0 is a start.
     metrics = MotionMetrics('cpu')
-    metrics.update(pred, target, torch.tensor([[False, True], [False, True]]), state)
+    update(metrics, pred, target, torch.tensor([[False, True], [False, True]]), state)
     result = metrics.result()
     assert result['val_turn_active_count'] == 2
     assert result['val_turn_recall'] == .5
@@ -44,7 +50,7 @@ def test_continuing_to_turn_is_not_a_correct_stop():
     state = torch.zeros(2, 5)
     state[:, 4] = -.8
     metrics = MotionMetrics('cpu')
-    metrics.update(pred, target, torch.zeros(2, 1, dtype=torch.bool), state)
+    update(metrics, pred, target, torch.zeros(2, 1, dtype=torch.bool), state)
     result = metrics.result()
     assert result['val_first_turn_stop_count'] == 2
     assert result['val_first_turn_stop_recall'] == .5
@@ -58,7 +64,7 @@ def test_left_and_right_starts_are_not_hidden_in_one_average():
     pred = target.clone()
     pred[1, 0, 4] = 0
     metric = MotionMetrics('cpu')
-    metric.update(pred, target, torch.zeros(2, 1, dtype=torch.bool), torch.zeros(2, 5))
+    update(metric, pred, target, torch.zeros(2, 1, dtype=torch.bool), torch.zeros(2, 5))
     result = metric.result()
     assert result['val_first_turn_left_start_recall'] == 1
     assert result['val_first_turn_right_start_recall'] == 0
@@ -91,3 +97,26 @@ def test_replay_preserves_repeated_closed_commands_as_distinct_events():
     starts, ends = gripper_events(rows, 40)
     assert starts == {5: 'close_gripper', 17: 'close_gripper'}
     assert ends == {17, 29}
+
+
+def test_group_metrics_use_aligned_future_states_and_mask_padding():
+    target = torch.zeros(1, 4, 5)
+    target[0, 2, 4] = .6
+    target[0, 1, 2] = 1
+    prediction = target.clone()
+    prediction[0, 1, 2], prediction[0, 1, 4] = 0, 1  # Fails open and stop switches.
+    states = torch.zeros_like(target)
+    states[0, 1, 4] = 1
+    amplitude = torch.ones(1, 4, 1)
+    target[:, 3], prediction[:, 3], states[:, 3], amplitude[:, 3] = [float('nan')] * 4
+    metric = MotionMetrics('cpu')
+    metric.update(prediction, target, torch.tensor([[False, False, False, True]]),
+                  torch.zeros(1, 5), action_states=states, turn_magnitude=amplitude)
+    r = metric.result()
+    assert r['val_base_groups']['stop']['ordinary']['recall'] == 1
+    assert r['val_base_groups']['stop']['switch']['recall'] == 0
+    assert r['val_gripper_groups']['open']['switch']['recall'] == 0
+    assert r['val_slow_turn_count'] == 1
+    assert r['val_slow_turn_amplitude_mse'] == pytest.approx(.16)
+    assert r['val_slow_turn_max_baseline_mse'] == pytest.approx(.16)
+    assert r['val_slow_turn_amplitude_mae'] == pytest.approx(.4)

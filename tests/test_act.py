@@ -111,6 +111,10 @@ def test_sample_alignment_and_padding(dataset_root, tmp_path):
     physical = first["actions"][:3].numpy() * stats["action_std"] + stats["action_mean"]
     np.testing.assert_allclose(physical[:, 0], [0, 1, 2], atol=1e-6)
     assert torch.all(last["actions"][1:] == 0)
+    assert first['action_states'].shape == (32, 5)
+    np.testing.assert_array_equal(first['action_states'][:3, 0], [0, 1, 2])
+    assert last['action_states'][0, 0] == 2 and torch.all(last['action_states'][1:] == 0)
+    assert data[3]['action_states'][0, 0] == 100  # No state crosses episode boundaries.
     assert data[3]["state"][0] > 100
 
 
@@ -128,7 +132,8 @@ def test_hybrid_network_gradients_and_deterministic_inference():
     repeat = model(pixels, state)
     for key in output:
         torch.testing.assert_close(output[key], repeat[key])
-    loss, _, _ = hybrid_loss(output, actions, pad, stats, [1.] * 5)
+    balance = {'base_group_weights': [[1., 1.]] * 5, 'gripper_group_weights': [[1., 1.]] * 2}
+    loss, _, _ = hybrid_loss(output, actions, pad, stats, balance, torch.zeros_like(actions))
     loss.backward()
     for layer in (model.arm_head, model.gripper_head, model.base_head, model.turn_head, model.backbone[0]):
         assert layer.weight.grad.abs().sum() > 0
@@ -136,6 +141,17 @@ def test_hybrid_network_gradients_and_deterministic_inference():
     assert normalized_prediction(output, stats).shape == (2, 32, 5)
     assert masked_l1(torch.ones(1, 32, 5), torch.zeros(1, 32, 5),
                      torch.arange(32)[None] > 0).item() == 1
+
+
+def test_network_exposes_raw_amplitude_and_does_not_accept_future_state():
+    model = ACT(tiny_config().model).eval()
+    with torch.no_grad():
+        model.turn_head.weight.zero_()
+        model.turn_head.bias.fill_(2.)
+        output = model(torch.zeros(1, 1, 3, 240, 320), torch.zeros(1, 5))
+    torch.testing.assert_close(output['turn'], torch.full((1, 32, 1), 2.))
+    with pytest.raises(TypeError):
+        model(torch.zeros(1, 1, 3, 240, 320), torch.zeros(1, 5), torch.zeros(1, 32, 5))
 
 
 def test_train_resume_and_standalone_policy(dataset_root, tmp_path, monkeypatch, capsys):
@@ -157,7 +173,8 @@ def test_train_resume_and_standalone_policy(dataset_root, tmp_path, monkeypatch,
     assert [r["epoch"] for r in rows] == [0, 1]
     assert len(rows[0]["val_mae_physical"]) == 5
     assert rows[0]["train_loss"] == pytest.approx(sum(rows[0][f'train_{k}'] for k in
-        ('arm_l1', 'gripper_ce', 'base_ce', 'turn_l1')))
+        ('arm_l1', 'gripper_ce', 'base_ce', 'turn_mse')))
+    assert 'val_base_groups' in rows[0] and 'val_slow_turn_amplitude_mse' in rows[0]
     assert a['format_version'] == 2 and a['selection_metric'] == 'val_loss'
     assert a['class_balance']['counts'] == [6, 0, 0, 0, 0]
     with pytest.raises(FileExistsError):

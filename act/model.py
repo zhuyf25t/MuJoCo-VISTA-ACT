@@ -128,4 +128,4 @@ class ACT(nn.Module):
             h = layer(h, query_pos, memory, pos)
         h = self.decoder_norm(h)
         return {"arm": self.arm_head(h), "gripper_logits": self.gripper_head(h),
-                "base_logits": self.base_head(h), "turn": self.turn_head(h).sigmoid()}
+                "base_logits": self.base_head(h), "turn": self.turn_head(h)}

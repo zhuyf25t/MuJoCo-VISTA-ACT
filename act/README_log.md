@@ -188,7 +188,9 @@ python -m act.prepare --dataset-root data/act_v1 --experiment output/act/exp_002
 3. 动作不足 K 时，在**标准化空间**补零。
 4. `is_pad[k] = (k >= 有效动作长度)`；True 表示补齐，应排除。
 
-单 sample 返回 `images [1,3,240,320]`、`state [5]`、`actions [32,5]`、`is_pad [32]`。DataLoader 再增加 batch 维。
+单 sample 返回 `images [1,3,240,320]`、`state [5]`、`actions [32,5]`、
+`action_states [32,5]`、`is_pad [32]`。action_states 保持物理单位，仅用于监督分组，
+与 actions 使用同一个 padding 掩码；DataLoader 再增加 batch 维。
 
 假设 T=3、K=32，sample t=2 只含最后一个真实动作，后面 31 拍全为 padding。补齐零不代表物理上的“停住”；它根本不进入动作误差，也不作为后验注意力的有效 key/value。
 
@@ -233,7 +235,8 @@ python -m act.prepare --dataset-root data/act_v1 --experiment output/act/exp_002
 每个 `DecoderLayer` 先在 K 个动作位置之间自注意力，再以动作表示为 query、观测 memory 为 key/value 做交叉注意力，最后走 FFN；每段均有 dropout、残差、LayerNorm。自注意力没有 causal mask：32 拍同时预测，不是依次生成并把上一拍输出喂回去。
 
 7 层后经 decoder_norm，分别接 Linear(512,2) 肩肘头、Linear(512,2) 夹爪 logits、
-Linear(512,5) 底盘 logits、Linear(512,1)+sigmoid 转向幅度。每个位置仍代表一拍。
+Linear(512,5) 底盘 logits、Linear(512,1) 原始转向幅度。每个位置仍代表一拍。
+训练不使用 sigmoid 或裁剪；推理先融合幅度，再在动作解码时限幅到 0–1。
 肩肘保持标准化回归；夹爪 closed/open 解码为 0/1；底盘 stop/forward/back/left/right
 解码为 (v,w)=(0,0)/(0.3,0)/(-0.3,0)/(0,r)/(0,-r)。v 单位 m/s，r 单位 rad/s，范围 0–1。
 最终动作仍是五维；不调用 VISTA 的多拍工具。
@@ -253,8 +256,8 @@ AdamW 分为 backbone 与其余参数两组学习率。AMP 仅在配置开启且
 每个 epoch 均匀打乱所有训练起点。forward 只读图像和实测状态，随后用未来动作标签计算：
 
 ```text
-loss = 肩肘标准化 L1 均值 + 夹爪 CE 均值
-     + 按训练频次加权的底盘 CE 均值 + 真值转向位置的幅度 L1 均值
+loss = 肩肘标准化 L1 均值 + 类别内切换加权的夹爪 CE 均值
+     + 类别及切换加权的底盘 CE 均值 + 真值转向位置的原始幅度 MSE 均值
 ```
 
 四项固定系数 1，没有额外 loss 调参开关。幅度按 1 rad/s 归一化，不能把前进 m/s 当转向幅度。
@@ -262,9 +265,16 @@ loss = 肩肘标准化 L1 均值 + 夹爪 CE 均值
 也有幅度梯度。所有项先索引有效位置再计算，padding 不进入损失；没有转向的 batch 幅度项为零。
 
 训练集每个实际动作 t 会出现在 min(K,t+1) 个有效 chunk 位置。按此统计 N_c，取
-w_c=N/(C_present*N_c)，让存在的底盘类别对平均 CE 的总贡献相等。权重只读训练集，
+w_c=N/(C_present*N_c)，让存在的底盘类别的总权重相等。权重只读训练集，
 不改变验证分布、不重采样，不删除静止帧。加权 CE 用有效位置数作分母，避免 batch 内
 只有一种类别时，除以权重和把稀有类权重消掉。class_balance.json 和 checkpoint 均保存统计。
+
+每个类别进一步分 ordinary/switch，以 `w_c*N_c/(G_c*N_cg)` 分配权重：保持类别总权重，
+将其均分给实际存在的子组。夹爪以原权重 w_c=1 开始，不改变开/闭类别原有的总权重。
+缺失子组使用原类别权重作为验证回退。所有统计仍包含标签在重叠 chunk 中的实际出现次数。
+分组使用该动作前的实测速度/开度，规则集中在 action_codec.transition_masks。
+Dataset 的 action_states 是与 K 个动作对齐的物理状态，padding 同步；只进入监督和指标计算。
+forward 仍只有当前 images 和归一化 state，不会看到未来状态。
 
 AdamW 更新前 unscale 并裁剪梯度，非有限 loss 或梯度明确报错。
 
@@ -277,12 +287,14 @@ AdamW 更新前 unscale 并裁剪梯度，非有限 loss 或梯度明确报错�
 | 指标 | 含义 |
 | --- | --- |
 | train_loss / val_loss | 四头混合目标；val_loss 选择 best 并用于早停 |
-| train/val_arm_l1、gripper_ce、base_ce、turn_l1 | 各项损失，不混淆单位和分母 |
+| train/val_arm_l1、gripper_ce、base_ce、turn_mse | 各项损失，不混淆单位和分母 |
 | train_l1 / val_l1 | 解码后的五维标准化 L1 |
 | val_mae_physical / val_first_mae_physical | 整块/第一拍的五维物理误差 |
 | val_base_recall / val_first_base_recall | 底盘五类逐类召回；同时保存混淆矩阵和宏平均 |
 | val_gripper_recall | 开/闭逐类召回；另有从闭到开、从开到闭的机会召回 |
 | val_first_turn_* | 左右启动、停止、误转向等切换指标 |
+| val_base_groups / val_gripper_groups | 全 chunk 每个类别内部 ordinary/switch 的数量、答对数量和召回 |
+| val_slow_turn_* | 真值幅度小于最大值的条件幅度误差与恒最大转速基线，不包含选错类别的影响 |
 
 标签来自命令而非实测速度。启动转向要求实测 |w|<0.05、标签 |w|>0.2，
 预测方向相同且 |w|>0.2 才算正确；停止时预测 |w|<0.05 才算正确。
@@ -302,6 +314,9 @@ Train 和 Valid 阶段分别报告当前 batch 进度。train_loss/val_loss 为�
 例如 best 从 0.2530 降至 0.2528，best.pt 会更新；当 min_delta=0.001 时，这次改善未必重置早停计数，因为 early_best 是另一个参考值。因此“更新 best”和“早停计数归零”不是同一个条件。
 
 `save_checkpoint()` 使用临时文件、fsync、替换；每轮先写 last，若有新最佳再写 best，最后追加指标。checkpoint 包含 format_version、模型、优化器、GradScaler、结构配置、schema、归一化统计、prepared 元数据、epoch/global_step、best 与早停状态、随机状态、当轮指标、版本来源。v2 还保存 action_codec、class_balance 和 selection_metric；文件大小随网络配置与优化器状态变化。
+
+当前 action_codec 契约版本为 2，记录 linear_mse 和 within_class_switch_balance_v1。
+版本 1 的 sigmoid 幅度 checkpoint 会被拒绝；应新建实验目录，复用原 splits 重新训练。
 
 ### 8.6 resume 的边界
 

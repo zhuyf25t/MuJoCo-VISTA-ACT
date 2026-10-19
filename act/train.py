@@ -41,7 +41,7 @@ def move_batch(batch, device):
 
 
 @torch.no_grad()
-def validate(model, loader, device, stats, progress="auto", description="Validation", train_loss=None, base_weights=None):
+def validate(model, loader, device, stats, progress="auto", description="Validation", train_loss=None, balance=None):
     model.eval()
     error = torch.zeros(model.cfg.action_dim, device=device, dtype=torch.float64)
     first_error = torch.zeros_like(error)
@@ -56,7 +56,8 @@ def validate(model, loader, device, stats, progress="auto", description="Validat
         for batch in loader:
             batch = move_batch(batch, device)
             output = model(batch["images"], batch["state"])
-            _, parts, counts = hybrid_loss(output, batch["actions"], batch["is_pad"], stats, base_weights)
+            _, parts, counts = hybrid_loss(output, batch["actions"], batch["is_pad"], stats,
+                                          balance, batch["action_states"])
             losses.update(parts, counts)
             prediction = normalized_prediction(output, stats)
             if not torch.isfinite(prediction).all():
@@ -71,7 +72,8 @@ def validate(model, loader, device, stats, progress="auto", description="Validat
             target_g = batch["actions"][:, :, 2] * std[2] + mean[2]
             correct_gripper += int((((pred_g >= .5) == (target_g >= .5)) & valid).sum())
             motion.update(prediction * std + mean, batch["actions"] * std + mean,
-                          batch["is_pad"], batch["state"] * state_std + state_mean)
+                          batch["is_pad"], batch["state"] * state_std + state_mean,
+                          action_states=batch["action_states"], turn_magnitude=output["turn"])
             batches.advance(train_loss=train_loss, val_loss=losses.result("val")["val_loss"])
     if count == 0:
         raise ValueError("Empty validation loader")
@@ -149,6 +151,19 @@ def print_epoch_summary(metrics, epochs, best, best_epoch, stale, cfg, improved)
         left_text = "无样本" if left is None else f"{left:.1%}"
         right_text = "无样本" if right is None else f"{right:.1%}"
         print(f"  启动左转召回={left_text} | 启动右转召回={right_text}", flush=True)
+        def percent(key):
+            value = metrics.get(key)
+            return "无样本" if value is None else f"{value:.1%}"
+        print(f"  首步开爪切换召回={percent('val_first_open_from_closed_recall')} | "
+              f"首步闭爪切换召回={percent('val_first_close_from_open_recall')}", flush=True)
+        print(f"  全 chunk 底盘切换/其余准确率={percent('val_base_switch_accuracy')}/"
+              f"{percent('val_base_ordinary_accuracy')} | "
+              f"夹爪切换/其余={percent('val_gripper_switch_accuracy')}/"
+              f"{percent('val_gripper_ordinary_accuracy')}", flush=True)
+        slow = metrics.get("val_slow_turn_amplitude_mse")
+        if slow is not None:
+            print(f"  减速幅度 MSE={slow:.5f} | 恒最大转速基线="
+                  f"{metrics['val_slow_turn_max_baseline_mse']:.5f}（仅幅度头，不含选错类别）", flush=True)
         if recall < .2:
             print("  注意：转向召回低，整体 L1 不能证明模型会导航；请先检查分动作指标和闭环表现。", flush=True)
     if cfg.training.patience:
@@ -290,7 +305,11 @@ def _train(root, experiment, epochs, cfg, device, resume, backbone_weights, prog
           f"K={cfg.model.chunk_size} | 从第 {start_epoch + 1} 轮训练到第 {epochs} 轮", flush=True)
     print(f"底盘类别：{balance['base_modes']} | 有效 chunk 标签数：{balance['counts']}\n"
           f"自动类别权重：{balance['weights']}", flush=True)
-    print("每轮均匀遍历训练起点；四头损失直接相加；训练/推理均为确定性 latent，无 KL。\n"
+    print(f"类别内分组顺序：{balance['group_order']}\n"
+          f"底盘分组计数：{balance['base_group_counts']} | 权重：{balance['base_group_weights']}\n"
+          f"夹爪分组计数：{balance['gripper_group_counts']} | 权重：{balance['gripper_group_weights']}", flush=True)
+    print("每轮均匀遍历训练起点；类别内切换/其余分担原总权重；未来状态仅用于监督。\n"
+          "四头损失直接相加；幅度使用线性输出 + MSE、执行前限幅；确定性 latent，无 KL。\n"
           "val_loss 为混合验证损失，用于 best.pt 和早停；L1 与逐类指标用于诊断。\n"
           "离线损失不等于仿真成功率。metrics.jsonl 的 epoch 从 0 开始。", flush=True)
     for epoch in range(start_epoch, epochs):
@@ -306,7 +325,7 @@ def _train(root, experiment, epochs, cfg, device, resume, backbone_weights, prog
                 with context:
                     output = model(batch["images"], batch["state"])
                     loss, parts, counts = hybrid_loss(output, batch["actions"], batch["is_pad"],
-                                                       stats, balance["weights"])
+                                                       stats, balance, batch["action_states"])
                 with torch.no_grad():
                     prediction = normalized_prediction(output, stats)
                     l1 = masked_l1(prediction, batch["actions"], batch["is_pad"])
@@ -328,7 +347,7 @@ def _train(root, experiment, epochs, cfg, device, resume, backbone_weights, prog
         metrics = {"epoch": epoch, "global_step": step, "train_l1": action_total / action_count,
                    **train_metrics,
                    **validate(model, loaders["val"], device, stats, progress,
-                              f"Valid {epoch + 1:02d}/{epochs}", train_metrics["train_loss"], balance["weights"]),
+                              f"Valid {epoch + 1:02d}/{epochs}", train_metrics["train_loss"], balance),
                    "elapsed_seconds": time.monotonic() - started}
         score = metrics["val_loss"]
         if not math.isfinite(score):

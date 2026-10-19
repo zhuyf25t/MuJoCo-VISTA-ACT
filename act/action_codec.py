@@ -4,9 +4,10 @@ import torch
 BASE_MODES = ("stop", "forward", "back", "left", "right")
 DRIVE_SPEED = 0.3  # m/s; distinct from angular speed.
 TURN_SPEED = 1.0   # rad/s; the magnitude head predicts a fraction of this range.
-CONTRACT = {"version": 1, "base_modes": list(BASE_MODES),
+CONTRACT = {"version": 2, "base_modes": list(BASE_MODES),
             "gripper_modes": ["closed", "open"], "drive_speed_m_s": DRIVE_SPEED,
-            "turn_max_rad_s": TURN_SPEED, "latent": "deterministic"}
+            "turn_max_rad_s": TURN_SPEED, "latent": "deterministic",
+            "turn_head": "linear_mse", "supervision": "within_class_switch_balance_v1"}
 
 
 def action_labels(physical, *, validate=True):
@@ -31,12 +32,34 @@ def action_labels(physical, *, validate=True):
     return base, (g >= .5).long(), w.abs() / TURN_SPEED
 
 
+def transition_masks(physical, measured):
+    """Identify clear state-to-command switches, using physical units.
+
+    Gripper openings between .4 and .6 and intermediate motion count as ordinary
+    unless a different motion component clearly needs to stop. These are measured
+    state conditions, not VISTA tool boundaries. Future states are labels only.
+    """
+    if physical.shape != measured.shape or physical.shape[-1] != 5:
+        raise ValueError("Actions and supervision states must have matching [...,5] shapes")
+    base, gripper, _ = action_labels(physical, validate=False)
+    v, w = measured[..., 3], measured[..., 4]
+    moving, turning = v.abs() > .05, w.abs() > .2
+    stop_switch = (base == 0) & (moving | turning)
+    drive_switch = ((base == 1) | (base == 2)) & (
+        (v * physical[..., 3].sign() < .05) | turning)
+    turn_switch = (base >= 3) & ((w * physical[..., 4].sign() < .05) | moving)
+    grip_switch = ((gripper == 0) & (measured[..., 2] > .6)) | (
+        (gripper == 1) & (measured[..., 2] < .4))
+    return stop_switch | drive_switch | turn_switch, grip_switch
+
+
 def pack_heads(heads):
     """Pack continuous arms, probabilities and class-conditioned turn moments.
 
     Linear temporal fusion is performed on this packet BEFORE choosing a class.
     Turn moments keep unrelated stop/forward/opposite-turn magnitudes out of the
-    selected direction's conditional average.
+    selected direction's conditional average. Raw amplitudes are fused before
+    decode_packet clamps the selected amplitude to the executable range.
     """
     base = heads["base_logits"].float().softmax(-1)
     return torch.cat((heads["arm"].float(), heads["gripper_logits"].float().softmax(-1),

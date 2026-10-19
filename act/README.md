@@ -41,7 +41,7 @@
 ## 当前网络和损失（v2）
 
 每个 Decoder 向量分别经过四个头：肩肘两个标准化角度、夹爪两个 logits、底盘五个 logits、
-一个 sigmoid 转向幅度。CNN、Encoder/Decoder 层数和 K 不变。训练与推理共用一个可学习的
+一个线性转向幅度（训练不裁剪，执行解码时限幅到 0–1）。CNN、Encoder/Decoder 层数和 K 不变。训练与推理共用一个可学习的
 常量 latent token；不读取专家未来动作作为网络输入，不使用 CVAE 后验或 KL。
 
 底盘类别顺序固定为 stop、forward、back、left、right。forward/back 为 ±0.3 m/s，
@@ -50,8 +50,8 @@ left/right 的角速度为 ±r×1.0 rad/s；其余对应速度为零。夹爪类
 训练前检查命令满足这些条件；不支持同时前进和转向的标签，出现此类数据会明确报错。
 
 ```text
-loss = mean(肩肘标准化 L1) + mean(夹爪 CE)
-     + mean(w[class] × 底盘 CE) + mean(真实转向位置的幅度 L1)
+loss = mean(肩肘标准化 L1) + mean(w_grip[class,group] × 夹爪 CE)
+     + mean(w_base[class,group] × 底盘 CE) + mean(真实转向位置的原始幅度 MSE)
 ```
 
 四项系数固定为 1。幅度是角速度除以 1 rad/s 后的无量纲数，绝不与 m/s 共用幅度。
@@ -62,17 +62,37 @@ loss = mean(肩肘标准化 L1) + mean(夹爪 CE)
 `w_c=N/(C_present*N_c)`。N_c 统计的是有效 chunk 位置：同一集第 t 帧的标签出现
 `min(K,t+1)` 次。验证集和 padding 不参与权重。缺失类权重为零并在统计中列出。
 CE 用有效位置数作分母，不用每个 batch 的权重和，避免稀有类权重在单类 batch 中被抵消。
+随后在各类别内部区分 ordinary/switch：保持该类别的原总权重，让存在的两个子组各占一半。
+子组权重为 `w_c * N_c / (G_c * N_cg)`，G_c 是该类别实际存在的子组数。夹爪原始 w_c=1，
+保留开/闭各自原有总权重。训练中没有出现的子组沿用该类别原权重，避免验证时被忽略。
+停止切换要求实测 |v|>0.05 m/s 或 |w|>0.2 rad/s；启动/换向要求目标方向的实测速度小于
+0.05，或另一运动分量仍在运动（直行检测 |w|>0.2、转向检测 |v|>0.05）。开爪切换要求
+当前开度<0.4，闭爪切换要求开度>0.6；其余位置归入 ordinary。
+Dataset 返回动作块对应的物理状态 `action_states`，仅供计算这些监督分组，绝不送入模型。
+网络输入仍然是当前图片和当前状态；不修改 HDF5、控制器或采集流程。
 统计写入 `class_balance.json` 并存进 checkpoint，恢复时重新核对。
 
 `best.pt` 和早停使用最小 `val_loss`（同一混合目标，复用训练权重），L1 只作诊断。
 验证损失逐项累计：幅度项按真实转向数平均，其余按有效位置数平均，不受验证 batch 切分影响。
 日志报告底盘五类/夹爪两类混淆矩阵与召回、左右转启动、停止、误转向、前后行启动和开闭爪机会。
+新增全 chunk 各类别的切换/其余计数与召回，以及减速标签位置的条件幅度 MSE、限幅后 MAE
+和恒最大转速基线。条件幅度指标不含分类错误；闭环表现还需要结合方向和停止指标。
 转向正确要求方向正确且 |w|>0.2 rad/s；停止转向要求 |w|<0.05 rad/s。
 高离线指标不能替代闭环捡球、搬运、投放成功率。
 
-本分支只支持混合动作头 checkpoint，旧五维回归 checkpoint 不能训练、恢复或评估。
+本分支只支持当前混合动作头 checkpoint（action contract version=2）。旧五维回归和
+旧 sigmoid 幅度头 checkpoint 均不能训练、恢复或评估，避免权重被按不同语义解释。
 请建立新实验目录；数据格式不变，可继续使用原来的 HDF5。latent_dim、posterior_layers、
 kl_weight、重采样和 Huber 配置项已删除。
+
+已有 `output/act` 的实验应保留，更新代码后使用新目录、原来的划分重新训练：
+
+```bash
+python -m act.prepare --dataset-root data/act_v1 --experiment output/act_switch_1019 --splits output/act/splits.json
+python -m act.train --dataset-root data/act_v1 --experiment output/act_switch_1019 --config act/configs/baseline.yaml --epochs 10 --device cuda
+```
+
+这次首次训练不加 `--resume`；新实验后续中断恢复才使用该参数。
 
 ### 不重新训练，检查一个 checkpoint 的转向
 
@@ -199,7 +219,7 @@ Valid 01/100: ... train_loss=..., val_loss=...
 训练期间验证值为 pending。`--progress auto` 在终端显示动态条，重定向时约每 10 秒在
 batch 完成后输出进展；always 强制条，never 只输出阶段和每轮摘要。
 
-`metrics.jsonl` 保存 train/val 的 arm_l1、gripper_ce、base_ce、turn_l1、总 loss；
+`metrics.jsonl` 保存 train/val 的 arm_l1、gripper_ce、base_ce、turn_mse、总 loss；
 `train_l1` 和 `val_l1` 为解码后五维标准化 L1。
 还有 `val_mae_physical`、`val_first_mae_physical`、底盘/夹爪逐类指标和动作切换指标。
 训练有 dropout 且参数持续更新，验证为 eval 模式，不能单凭一个小差值断言过拟合。
