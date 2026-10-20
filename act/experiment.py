@@ -81,38 +81,28 @@ class EpochEvaluator:
             # their document identity so already committed reports stay usable.
             self.protocol_sha256 = digest(saved)
         else:
-            artifacts = ('task_metrics.jsonl', 'best.pt', 'best.json', 'task_best.pt', 'task_best.json')
-            if (any((experiment / name).exists() for name in artifacts)
-                    or any(experiment.glob('eval_epoch_*'))):
-                raise ValueError('Existing evaluation has no matching v2 protocol; start a new experiment')
+            if any((experiment / name).exists() for name in ('best.pt', 'best.json')):
+                raise ValueError('Historical best requires best.pt, best.json and task_eval_protocol.json together')
             atomic_json(path, self.protocol)
             self.protocol_sha256 = digest(self.protocol)
 
     @staticmethod
-    def _records(experiment):
+    def _record_evaluation(experiment, record):
+        """Keep a journal without using old logs as the best-model authority."""
         path = experiment / 'task_metrics.jsonl'
-        if not path.exists():
-            return []
-        lines = path.read_text(encoding='utf-8').splitlines()
-        records = []
-        for index, line in enumerate(lines):
+        text = path.read_text(encoding='utf-8') if path.exists() else ''
+        for line in text.splitlines():
             try:
-                records.append(json.loads(line))
-            except json.JSONDecodeError as exc:
-                if index != len(lines) - 1:
-                    raise ValueError('Corrupt task metric history; start a new experiment') from exc
-                # A crash may leave only the final append incomplete.
-        return records
-
-    @staticmethod
-    def _write_records(experiment, records):
-        log = experiment / 'task_metrics.jsonl'
-        temporary = log.with_suffix('.tmp')
-        with temporary.open('w', encoding='utf-8') as stream:
-            stream.write(''.join(json.dumps(row, allow_nan=False) + '\n' for row in records))
+                if json.loads(line) == record:
+                    return
+            except json.JSONDecodeError:
+                pass  # Preserve incomplete historical lines; they cannot select best.
+        with path.open('a', encoding='utf-8') as stream:
+            if text and not text.endswith('\n'):
+                stream.write('\n')
+            stream.write(json.dumps(record, allow_nan=False) + '\n')
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, log)
 
     @staticmethod
     def _require_checkpoint(checkpoint):
@@ -225,41 +215,61 @@ class EpochEvaluator:
                 or type(record.get('epoch')) is not int or record['epoch'] < 1):
             raise ValueError('Cannot compare task scores from different protocols; start a new experiment')
 
-    def _publish(self, experiment, record):
-        records = self._records(experiment)
-        for existing in records:
-            self._validate_record(existing)
-            identity = set(existing) | set(record)
-            identity -= {'task_eval', 'source_manifest', 'source_sha256'}
-            if (existing['epoch'] == record['epoch']
-                    and any(existing.get(key) != record.get(key) for key in identity)):
-                raise ValueError('Epoch task record differs from its immutable evaluation')
-        prior_best = max((tuple(row['score']) for row in records), default=None)
-        new_epoch = not any(row['epoch'] == record['epoch'] for row in records)
-        improved = new_epoch and (prior_best is None or tuple(record['score']) > prior_best)
-        records = [row for row in records if row['epoch'] != record['epoch']] + [record]
-        records.sort(key=lambda row: row['epoch'])
-        self._write_records(experiment, records)
-        best = max(records, key=lambda row: tuple(row['score']))  # Sorted ties retain earliest epoch.
+    def load_best(self, experiment, checkpoint=None):
+        """Validate the optional, portable best bundle without opening old snapshots."""
+        experiment = Path(experiment)
         selected, model_path = experiment / 'best.json', experiment / 'best.pt'
-        previous = read_json(selected) if selected.exists() else {}
-        if (any(previous.get(key) != value for key, value in best.items()) or not model_path.exists()
-                or previous.get('best_sha256') != file_digest(model_path)):
-            source = Path(best['checkpoint'])
-            if file_digest(source) != best['checkpoint_sha256']:
-                raise ValueError('Selected immutable snapshot has changed')
+        if not selected.exists() and not model_path.exists():
+            return None
+        if not all(path.is_file() for path in (
+                selected, model_path, experiment / 'task_eval_protocol.json')):
+            raise ValueError('Historical best requires best.pt, best.json and task_eval_protocol.json together')
+        metadata = read_json(selected)
+        self._validate_record(metadata)
+        if (metadata.get('best_epoch') != metadata['epoch']
+                or metadata.get('best_score') != metadata['score']
+                or metadata.get('best_sha256') != file_digest(model_path)):
+            raise ValueError('Historical best.pt and best.json do not match')
+        best = {key: value for key, value in metadata.items()
+                if key not in ('best_epoch', 'best_score', 'best_sha256')}
+        saved = load_checkpoint(model_path)
+        self._require_checkpoint(saved)
+        if saved['epoch'] + 1 != best['epoch'] or saved.get('task_selection') != best:
+            raise ValueError('Historical best.pt selection differs from best.json')
+        if checkpoint is not None:
+            identity = ('config', 'schema', 'stats', 'prepared', 'action_codec', 'selection_metric')
+            if (any(saved.get(key) != checkpoint.get(key) for key in identity)
+                    or saved['epoch'] > checkpoint['epoch']):
+                raise ValueError('Historical best does not belong to this training checkpoint')
+        return best
+
+    def _publish(self, experiment, record, previous):
+        if previous is not None and previous['epoch'] == record['epoch']:
+            identity = (set(previous) | set(record)) - {
+                'checkpoint', 'task_eval', 'source_manifest', 'source_sha256'}
+            if any(previous.get(key) != record.get(key) for key in identity):
+                raise ValueError('Epoch task record differs from its published best')
+        improved = previous is None or tuple(record['score']) > tuple(previous['score'])
+        best = record if improved else previous  # A tie keeps the existing best.
+        if improved:
+            source = Path(record['checkpoint'])
+            if file_digest(source) != record['checkpoint_sha256']:
+                raise ValueError('Evaluated immutable snapshot has changed')
             saved = load_checkpoint(source)
             self._require_checkpoint(saved)
+            selected, model_path = experiment / 'best.json', experiment / 'best.pt'
             save_checkpoint(model_path, {**saved, 'task_selection': best})
             atomic_json(selected, {**best, 'best_epoch': best['epoch'], 'best_score': best['score'],
                                    'best_sha256': file_digest(model_path)})
             print(f'Published best.pt epoch={best["epoch"]} score={best["score"]}', flush=True)
+        self._record_evaluation(experiment, record)
         return {**record, 'best_epoch': best['epoch'], 'best_score': best['score'], 'improved': improved}
 
     def __call__(self, experiment, checkpoint):
         self._require_checkpoint(checkpoint)
         experiment = Path(experiment).resolve()
         self.freeze_protocol(experiment)
+        previous = self.load_best(experiment, checkpoint)
         epoch = checkpoint['epoch'] + 1
         archive = experiment / 'checkpoints'
         archive.mkdir(exist_ok=True)
@@ -275,7 +285,7 @@ class EpochEvaluator:
                   'task_eval_protocol_sha256': self.protocol_sha256,
                   'task_eval': str(output / 'task_eval.json'),
                   'source_manifest': summary.get('evaluation_source_manifest')}
-        result = self._publish(experiment, record)
+        result = self._publish(experiment, record, previous)
         torch.cuda.empty_cache()
         return result
 

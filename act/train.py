@@ -216,6 +216,7 @@ def _train(root, experiment, epochs, cfg, device, resume, backbone_weights, prog
     try:
         evaluator = EpochEvaluator(evaluation_seeds, device=str(device), workers=workers, video_every=0)
         evaluator.freeze_protocol(experiment)
+        historical_best = evaluator.load_best(experiment, checkpoint)
         evaluator.source_manifest = archive_source(experiment)
     finally:
         restore_rng(saved_rng, generator)
@@ -242,9 +243,14 @@ def _train(root, experiment, epochs, cfg, device, resume, backbone_weights, prog
     print(f"训练全部 {len(manifest['episodes'])} 条示范 / {len(dataset):,} 帧 | K=32 | "
           f"每轮 {len(loader):,} 次更新；每轮以 520..539 场景闭环评估选择 best.pt", flush=True)
     if resume:
-        evaluate_saved(checkpoint)  # Repair an interrupted evaluation even if epochs are already complete.
+        if historical_best is None:
+            print("未加载历史 best；从续训后的新轮次重新选优。", flush=True)
+        else:
+            print(f"已加载历史 best：第 {historical_best['epoch']} 轮，评分 {historical_best['score']}。", flush=True)
         if start_epoch >= epochs:
-            return experiment / "best.pt"
+            print(f"已完成 {start_epoch} 轮，无需新增训练；不补评历史轮次。", flush=True)
+            return experiment / "best.pt" if historical_best is not None else last
+        print(f"从第 {start_epoch + 1} 轮继续训练，不补评历史轮次。", flush=True)
     for epoch in range(start_epoch, epochs):
         started = time.monotonic()
         model.train()

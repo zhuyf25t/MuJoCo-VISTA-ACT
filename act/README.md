@@ -142,9 +142,25 @@ python -u -m act.train \
   --resume --epochs 150 --device cuda --workers 10
 ```
 
-`last.pt` 包含权重、训练配置、优化器、AMP、随机状态和轮次，无需再传 YAML。续训仍需原始 HDF5，以及实验内的 `manifest.json`、`splits.json`、`stats.json`、`prepared.json`；保留整个实验目录即可保留历史选优和补评记录。
+`last.pt` 包含权重、训练配置、优化器、AMP、随机状态、epoch 和累计更新次数，无需再传 YAML。epoch 从 0 开始：`epoch=99` 表示已完成第 100 轮，接下来训练第 101 轮；`--epochs 150` 指总共训练到第 150 轮。
 
-只从完整 epoch 恢复，评估中断会先补评。源码变化允许续训，数据、配置和显式评估协议仍需匹配。`best.pt` 不保存优化器等续训状态，可以独立用于推理。
+原训练 HDF5 由 `--dataset-root` 指定，以下文件一起放在 `--experiment` 指定的目录：
+
+```text
+实验目录/
+├── last.pt                  # 恢复模型、优化器、随机状态和轮次
+├── manifest.json            # 冻结的训练示范清单
+├── splits.json              # 训练样本分配
+├── stats.json               # 归一化统计
+├── prepared.json            # 准备格式、数据哈希和样本数
+├── best.pt                  # 历史最佳模型（可选，加载历史 best）
+├── best.json                # 最佳轮次、成绩和模型哈希（可选，加载历史 best）
+└── task_eval_protocol.json  # 评估场景与评分规则（可选，加载历史 best）
+```
+
+三份可选文件一起保留即可继承历史最佳成绩；新成绩更好才替换 `best.pt`，同分保留原 best。不保留 `best.pt` 和 `best.json` 时，从续训后的轮次重新选优；评估协议缺失时自动生成，已有协议继续沿用。best 文件缺失一部分或相互不匹配时，会明确报错。训练始终恢复 `last.pt`。
+
+**`--resume` 直接进入下一轮，不补评历史轮次，即使上轮评估中断也一样。** 新轮次结束后照常评估。旧逐轮快照、评估目录和日志都不是续训必需文件。只从完整 epoch 恢复；源码变化允许续训，数据、训练配置及保留的评估协议仍需匹配。
 
 ## 文件布局
 
