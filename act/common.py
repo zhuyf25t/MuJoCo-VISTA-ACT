@@ -90,6 +90,8 @@ def load_prepared(experiment, root, cfg=None, verify_hashes=True):
     splits = read_json(experiment / "splits.json")
     stats = read_json(experiment / "stats.json")
     metadata = read_json(experiment / "prepared.json")
+    if metadata.get("format_version") != 2 or metadata.get("training_mode") != "all_demonstrations":
+        raise ValueError("Prepared data requires v2/all_demonstrations")
     for name, value in (("manifest", manifest), ("splits", splits), ("stats", stats)):
         if digest(value) != metadata[f"{name}_sha256"]:
             raise ValueError(f"Prepared {name} has changed; create a new experiment")
@@ -98,13 +100,10 @@ def load_prepared(experiment, root, cfg=None, verify_hashes=True):
     entries = {e["episode_id"]: e for e in manifest["episodes"]}
     if len(entries) != len(manifest["episodes"]):
         raise ValueError("Duplicate episode ids")
-    groups = [splits["train"], splits["val"]]
-    ids = groups[0] + groups[1]
-    if not all(groups) or len(set(ids)) != len(ids) or set(ids) != set(entries):
-        raise ValueError("Invalid or overlapping episode splits")
-    seeds = [{entries[i]["seed"] for i in group} for group in groups]
-    if seeds[0] & seeds[1]:
-        raise ValueError("Scene seed leakage between train and validation")
+    if (set(splits) != {"train", "val"} or not isinstance(splits["train"], list)
+            or not splits["train"] or splits["val"] != []
+            or len(set(splits["train"])) != len(splits["train"]) or set(splits["train"]) != set(entries)):
+        raise ValueError("Prepared data requires all demonstrations in train and val=[]")
     for entry in entries.values():
         if not (entry["status"] == "ready" and entry["selected_for_dataset"] is True and entry["success"] is True):
             raise ValueError("Unselected episode in frozen manifest")

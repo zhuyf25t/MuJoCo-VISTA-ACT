@@ -13,7 +13,10 @@ htmlcov/
 
 # Generated episodes, videos, reports, and temporary files
 /data/
-/output/
+/output/*
+!/output/vista/
+/output/vista/*
+!/output/vista/guide.md
 /tmp/
 *.log
 MUJOCO_LOG.TXT
@@ -40,3 +43,16 @@ Thumbs.db
 
 # Frozen local archive; excluded from normal searches and Git
 /_archive/
+
+# Local code-review inventory; the public file overview lives in README.md.
+/readme_file_explorer.md
+
+# Local review material outside the published runtime file list.
+/tests/
+/assets/
+/doc/
+/*.zip
+/act/README_log.md
+/act/autodl.md
+/brains/vista/README_log.md
+/brains/vista/prompts/system_old_*.txt

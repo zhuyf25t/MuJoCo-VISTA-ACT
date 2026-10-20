@@ -20,6 +20,8 @@ class ModelConfig:
     dim_feedforward: int = 2048
     dropout: float = 0.1
     pretrained_backbone: bool = True
+    # Optional denser visual grid; default keeps existing checkpoint behavior.
+    visual_stride: int = 32
 
     def __post_init__(self):
         self.cameras, self.image_hw = tuple(self.cameras), tuple(self.image_hw)
@@ -33,6 +35,8 @@ class ModelConfig:
             raise ValueError("Hybrid ACT requires five-dimensional state and action")
         if not 0 <= self.dropout < 1 or type(self.pretrained_backbone) is not bool:
             raise ValueError("Invalid dropout / pretrained_backbone")
+        if type(self.visual_stride) is not int or self.visual_stride not in (16, 32):
+            raise ValueError("visual_stride must be 16 or 32")
         if not self.cameras or len(set(self.cameras)) != len(self.cameras):
             raise ValueError("Need unique camera names")
         if len(self.image_hw) != 2 or any(type(x) is not int or x < 32 for x in self.image_hw):
@@ -49,9 +53,13 @@ class TrainConfig:
     seed: int = 42
     num_workers: int = 0
     amp: bool = False
-    # Zero disables early stopping. The run length must be explicitly supplied.
+    # Legacy checkpoint compatibility only; all-demonstration training requires zero.
     patience: int = 0
     min_delta: float = 0.0
+    # 1 preserves full inverse-frequency balancing; 0.5 softens rare-group weights.
+    balance_power: float = 1.0
+    # Position mass: (1-alpha) + alpha*K on query zero; normalized over valid positions.
+    first_query_weight: float = 0.0
 
     def __post_init__(self):
         if type(self.batch_size) is not int or self.batch_size < 1:
@@ -67,6 +75,10 @@ class TrainConfig:
             raise ValueError("Learning rates and grad_clip must be positive")
         if type(self.amp) is not bool:
             raise ValueError("amp must be boolean")
+        if not math.isfinite(self.balance_power) or not 0 <= self.balance_power <= 1:
+            raise ValueError("balance_power must be in [0, 1]")
+        if not math.isfinite(self.first_query_weight) or not 0 <= self.first_query_weight <= 1:
+            raise ValueError("first_query_weight must be in [0, 1]")
 
 
 @dataclass

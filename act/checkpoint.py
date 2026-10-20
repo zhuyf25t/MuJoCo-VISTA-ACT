@@ -9,6 +9,26 @@ from .config import config_from_dict
 from .common import validate_schema, validate_stats
 
 
+# Frozen deployment used for training-time task selection and published best.pt.
+# The null ensemble field is descriptive metadata, not a runtime option.
+DEFAULT_DEPLOYMENT = {"version": 1, "mode": "chunk_prefix", "execution_horizon": 8,
+                      "ensemble_coefficient": None}
+
+
+def deployment_metadata(checkpoint):
+    """Require the current K32/H8 deployment; never infer a missing protocol."""
+    saved = checkpoint.get("deployment")
+    if not isinstance(saved, dict):
+        raise ValueError("Checkpoint requires saved K32/H8 deployment")
+    chunk_size = checkpoint.get("config", {}).get("model", {}).get("chunk_size")
+    if (type(chunk_size) is not int or chunk_size != 32
+            or type(saved.get("version")) is not int
+            or type(saved.get("execution_horizon")) is not int
+            or any(key not in saved or saved[key] != value for key, value in DEFAULT_DEPLOYMENT.items())):
+        raise ValueError("Checkpoint requires saved K32/H8 deployment with ensemble off")
+    return dict(DEFAULT_DEPLOYMENT)
+
+
 def save_checkpoint(path, checkpoint):
     path = Path(path)
     temporary = path.with_suffix(".tmp")
@@ -28,6 +48,7 @@ def load_checkpoint(path):
         raise ValueError("Unsupported checkpoint format; this branch requires a hybrid ACT checkpoint")
     if checkpoint.get("action_codec") != CONTRACT:
         raise ValueError("Unsupported hybrid action contract")
+    deployment_metadata(checkpoint)
     return checkpoint
 
 

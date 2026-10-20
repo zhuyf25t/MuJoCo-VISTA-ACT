@@ -1,7 +1,7 @@
 """MuJoCo 仿真后端: 实现 hal 抽象接口 (MjRobot / MjWorld).
 
 所有 mujoco 读写、物理步进、车头相机渲染与"运动学吸附"封闭在本模块.
-闭爪动作期间，实测开度稳定且同一球持续接触两侧指垫内表面后，才启用
+闭合目标持续生效时，实测开度稳定且同一球持续接触两侧指垫内表面后，才启用
 辅助吸附；开爪或持续失去有效夹持时释放。候选及吸附状态留在后端，
 VISTA 仍通过图像和实测关节开度判断持球。
 """
@@ -17,6 +17,7 @@ import config
 from hal import RobotInterface, TickCallback, WorldInterface
 
 STEPS_PER_CTRL = int(round(config.CTRL_DT / config.SIM_DT))
+FRONT_RENDER_PROTOCOL = "front_renderer_one_frame_warmup_v1"
 
 
 class MjRobot(RobotInterface):
@@ -45,7 +46,6 @@ class MjRobot(RobotInterface):
         self._scratch = mujoco.MjData(model)
         self._measure_arm()
         self._attach: tuple[str, np.ndarray] | None = None
-        self._grasp_attempt_active = False
         self._grasp_candidate: str | None = None
         self._grasp_samples: deque[tuple[float, float]] = deque()
         self._grasp_lost_since: float | None = None
@@ -108,10 +108,16 @@ class MjRobot(RobotInterface):
     # ================= 感知 =================
     def front_image(self) -> np.ndarray:
         """渲染车头相机一帧 (离屏 EGL)."""
-        if self._front_renderer is None:
+        created = self._front_renderer is None
+        if created:
             w, h = config.CAM_FRONT_RES
             self._front_renderer = mujoco.Renderer(self.model, height=h, width=w)
         mujoco.mj_forward(self.model, self.data)     # 确保场景与 qpos 同步
+        if created:
+            # EGL's first draw can differ by one pixel from its steady rendering.
+            # Warm only the graphics resources: do not advance or refresh physics.
+            self._front_renderer.update_scene(self.data, camera=self._front_cam_id)
+            self._front_renderer.render()
         self._front_renderer.update_scene(self.data, camera=self._front_cam_id)
         return self._front_renderer.render().copy()
 
@@ -134,9 +140,6 @@ class MjRobot(RobotInterface):
         self.data.ctrl[self.i_act_fi] = float(goal_ctrl)
         if goal_ctrl < config.FINGER_CLOSED_THRESHOLD:
             self.detach_object()  # 开爪立即解除，不等下一次接触检测。
-        else:
-            self.finish_grasp_attempt()
-            self._grasp_attempt_active = self._attach is None
 
     def finger_ctrl_range(self) -> tuple[float, float]:
         rng = self.model.actuator_ctrlrange[self.i_act_fi]
@@ -207,16 +210,10 @@ class MjRobot(RobotInterface):
         self._grasp_candidate = None
         self._grasp_samples.clear()
 
-    def finish_grasp_attempt(self) -> None:
-        self._grasp_attempt_active = False
-        self._clear_grasp_candidate()
-
     def _auto_grasp(self) -> None:
-        """只在显式抓取尝试中获取对象；持续复核已确认的夹持。"""
+        """闭合目标允许持续接触判定；动作等待超时不改变物理目标。"""
         if self.data.ctrl[self.i_act_fi] < config.FINGER_CLOSED_THRESHOLD:
             self.detach_object()
-            return
-        if self._attach is None and not self._grasp_attempt_active:
             return
         # mj_step 已推进 qpos；刷新接触和几何，避免与上一步的派生量混用。
         mujoco.mj_forward(self.model, self.data)
@@ -258,12 +255,12 @@ class MjRobot(RobotInterface):
         relpos = gmat.T @ (self.data.xpos[self.model.body(name).id] - self.data.xpos[g])
         self._attach = (name, relpos)
         self._grasp_lost_since = None
-        self.finish_grasp_attempt()
+        self._clear_grasp_candidate()
 
     def detach_object(self) -> None:
         self._attach = None
         self._grasp_lost_since = None
-        self.finish_grasp_attempt()
+        self._clear_grasp_candidate()
 
     def attached_object(self) -> str | None:
         return self._attach[0] if self._attach is not None else None

@@ -39,64 +39,36 @@ def inspect_episode(root, entry, schema, check_pixels=True):
     return states, actions
 
 
-def choose_splits(entries, val_fraction=None, seed=42, explicit=None):
-    by_id = {e["episode_id"]: e for e in entries}
-    if len(by_id) != len(entries) or any(type(e.get("seed")) is not int for e in entries):
-        raise ValueError("Need unique episode ids and explicit integer scene seeds")
-    if explicit is not None:
-        if set(explicit) != {"train", "val"}:
-            raise ValueError("Split file must have train and val lists")
-        result = explicit
-    else:
-        if val_fraction is None or not 0 < val_fraction < 1:
-            raise ValueError("Specify --val-fraction or --splits explicitly")
-        seeds = sorted({e["seed"] for e in entries})
-        if len(seeds) < 2:
-            raise ValueError("Need at least two scene seeds")
-        np.random.default_rng(seed).shuffle(seeds)
-        n = min(len(seeds) - 1, max(1, round(len(seeds) * val_fraction)))
-        val_seeds = set(seeds[:n])
-        result = {part: [e["episode_id"] for e in entries if (e["seed"] in val_seeds) == (part == "val")]
-                  for part in ("train", "val")}
-    if not all(isinstance(result[p], list) and result[p] for p in ("train", "val")):
-        raise ValueError("Need nonempty train and val lists")
-    ids = result["train"] + result["val"]
-    if len(ids) != len(set(ids)) or not set(ids) <= set(by_id):
-        raise ValueError("Duplicate, overlapping or unknown episode ids")
-    train_seeds = {by_id[i]["seed"] for i in result["train"]}
-    if train_seeds & {by_id[i]["seed"] for i in result["val"]}:
-        raise ValueError("Same scene seed cannot occur in both splits")
-    return result
-
-
-def prepare(root, experiment, *, val_fraction=None, seed=42, explicit=None):
+def prepare(root, experiment):
     root, experiment = Path(root), Path(experiment)
     manifest = read_json(root / "manifest.json")  # Atomic collector publication gives a coherent snapshot.
     validate_schema(manifest["schema"])
     entries = [e for e in manifest["episodes"] if e.get("status") == "ready"
                and e.get("selected_for_dataset") is True and e.get("success") is True]
-    splits = choose_splits(entries, val_fraction, seed, explicit)
-    ids = set(splits["train"] + splits["val"])
-    entries = [e for e in entries if e["episode_id"] in ids]
+    if not entries:
+        raise ValueError("No valid successful demonstrations are available")
+    all_ids = [e["episode_id"] for e in entries]
+    if len(set(all_ids)) != len(all_ids) or any(type(e.get("seed")) is not int for e in entries):
+        raise ValueError("Need unique episode ids and integer scene seeds")
+    splits = {"train": all_ids, "val": []}
     if len({e["source_uid"] for e in entries}) != len(entries):
         raise ValueError("Duplicate source episode")
     train_states, train_actions, hashes = [], [], {}
     for entry in entries:
         states, actions = inspect_episode(root, entry, manifest["schema"])
         hashes[entry["episode_id"]] = file_digest(h5_path(root, entry["h5"]))
-        if entry["episode_id"] in splits["train"]:
-            train_states.append(states)
-            train_actions.append(actions)
+        train_states.append(states)
+        train_actions.append(actions)
     stats = {}
     for name, arrays in (("state", train_states), ("action", train_actions)):
         data = np.concatenate(arrays).astype(np.float64)
         stats[f"{name}_mean"] = data.mean(0).tolist()
         stats[f"{name}_std"] = np.maximum(data.std(0), 1e-2).tolist()
     frozen = {"schema": manifest["schema"], "episodes": entries}
-    metadata = {"format_version": 1, "manifest_sha256": digest(frozen), "splits_sha256": digest(splits),
-                "stats_sha256": digest(stats), "h5_sha256": hashes, "split_seed": seed,
-                "sample_counts": {part: sum(e["num_steps"] for e in entries if e["episode_id"] in splits[part])
-                                  for part in ("train", "val")}}
+    metadata = {"format_version": 2, "training_mode": "all_demonstrations",
+                "manifest_sha256": digest(frozen), "splits_sha256": digest(splits),
+                "stats_sha256": digest(stats), "h5_sha256": hashes,
+                "sample_counts": {"train": sum(e["num_steps"] for e in entries), "val": 0}}
     experiment.mkdir(parents=True, exist_ok=False)
     for name, value in (("manifest", frozen), ("splits", splits), ("stats", stats), ("prepared", metadata)):
         atomic_json(experiment / f"{name}.json", value)
@@ -107,13 +79,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset-root", required=True)
     parser.add_argument("--experiment", required=True)
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--val-fraction", type=float)
-    group.add_argument("--splits", help="JSON with explicit train and val episode-id lists")
-    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
-    result = prepare(args.dataset_root, args.experiment, val_fraction=args.val_fraction, seed=args.seed,
-                     explicit=read_json(args.splits) if args.splits else None)
+    result = prepare(args.dataset_root, args.experiment)
     print(result["sample_counts"])
 
 

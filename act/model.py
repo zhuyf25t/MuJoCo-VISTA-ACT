@@ -1,4 +1,4 @@
-"""ACT v2: unchanged visual/Transformer trunk, four supervised action heads.
+"""ACT v2: ResNet/Transformer trunk, four supervised action heads.
 
 The latent token is deterministic in training and inference; no CVAE posterior.
 """
@@ -84,6 +84,13 @@ class ACT(nn.Module):
         if initialize_backbone and backbone_weights is not None:
             # Offline ImageNet weights, downloaded from the official torchvision URL.
             backbone.load_state_dict(torch.load(backbone_weights, map_location="cpu", weights_only=True))
+        if cfg.visual_stride == 16:
+            # Keep every pretrained layer and tensor shape. Remove only the final
+            # spatial downsampling, including its residual shortcut; no dilation.
+            block = backbone.layer4[0]
+            block.conv1.stride = (1, 1)
+            block.downsample[0].stride = (1, 1)
+            block.stride = 1
         self.backbone = nn.Sequential(*list(backbone.children())[:-2])
         self.visual_projection = nn.Conv2d(512, d, kernel_size=1)
         self.state_projection = nn.Linear(cfg.state_dim, d)

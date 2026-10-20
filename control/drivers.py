@@ -155,17 +155,13 @@ class ArmDriver:
         def ready():
             return (self.r.attached_object() is not None if closing else
                     abs(self.r.finger_opening - opening_goal) <= config.GRIPPER_OPEN_GOAL_TOL)
-        try:
-            if closing:
-                self.r.command_drive(0.0, 0.0)
-            self.r.command_finger(goal)
-            # Keep one uninterrupted confirmation window. Image stability cannot
-            # substitute for confirmed grasp or reaching the opening target.
-            limit = config.GRIPPER_CLOSE_SECONDS if closing else config.GRIPPER_OPEN_SECONDS
-            wait_until_stable(self.r, limit, on_tick, read_observation, ready=ready)
-        finally:
-            # 即使回调中断，也不能在后续移动时突然获取新吸附对象。
-            self.r.finish_grasp_attempt()
+        if closing:
+            self.r.command_drive(0.0, 0.0)
+        self.r.command_finger(goal)
+        # Bound the controller's wait, while the physical target keeps applying.
+        # Image stability cannot substitute for confirmed grasp or opening.
+        limit = config.GRIPPER_CLOSE_SECONDS if closing else config.GRIPPER_OPEN_SECONDS
+        wait_until_stable(self.r, limit, on_tick, read_observation, ready=ready)
         held = self.r.attached_object() is not None
         if closing:
             if held:

@@ -20,5 +20,3 @@ training:
   seed: 42
   num_workers: 8
   amp: false
-  patience: 0
-  min_delta: 0.0

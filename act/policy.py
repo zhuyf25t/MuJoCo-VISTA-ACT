@@ -3,48 +3,25 @@ import numpy as np
 import torch
 
 from .action_codec import pack_heads, decode_packet
-from .checkpoint import load_checkpoint, model_from_checkpoint, normalized_prediction
+from .checkpoint import load_checkpoint, model_from_checkpoint, normalized_prediction, deployment_metadata
 from .dataset import image_tensor
 
 
-class TemporalEnsembler:
-    """Combine predictions for the SAME control tick; positive m favors older chunks."""
-    def __init__(self, coefficient=0.01):
-        if not np.isfinite(coefficient) or coefficient < 0:
-            raise ValueError("coefficient must be finite and nonnegative")
-        self.coefficient = coefficient
-        self.reset()
-
-    def reset(self):
-        self.chunks = []
-
-    def select(self, step, chunk):
-        chunk = np.asarray(chunk)
-        if chunk.ndim != 2 or len(chunk) == 0 or not np.isfinite(chunk).all():
-            raise ValueError("Expected finite [K,action_dim] chunk")
-        if self.chunks and step <= self.chunks[-1][0]:
-            raise ValueError("Control steps must increase; reset between episodes")
-        self.chunks.append((step, chunk.copy()))
-        self.chunks = [(start, array) for start, array in self.chunks if step - start < len(array)]
-        values = np.stack([array[step - start] for start, array in self.chunks])
-        weights = np.exp(-self.coefficient * np.arange(len(values)))
-        return (values * (weights / weights.sum())[:, None]).sum(0)
-
-
 class ACTPolicy:
-    def __init__(self, checkpoint_path, device="cpu", ensemble_coefficient=None):
+    def __init__(self, checkpoint_path, device="cpu"):
         checkpoint = load_checkpoint(checkpoint_path)
+        self.deployment = deployment_metadata(checkpoint)
+        self.execution_horizon = self.deployment["execution_horizon"]
         self.device = torch.device(device)
         self.model = model_from_checkpoint(checkpoint, self.device)
         self.schema = checkpoint["schema"]
         self.stats = {k: np.asarray(v, np.float32) for k, v in checkpoint["stats"].items()}
-        self.ensemble = TemporalEnsembler(ensemble_coefficient) if ensemble_coefficient is not None else None
         self.reset()
 
     def reset(self):
         self.step = 0
-        if self.ensemble:
-            self.ensemble.reset()
+        self._cached_chunk = None
+        self._cache_index = 0
 
     @torch.inference_mode()
     def _predict(self, images_rgb, measured_state):
@@ -69,10 +46,16 @@ class ACTPolicy:
 
     @torch.inference_mode()
     def act(self, images_rgb, measured_state):
-        output = self._predict(images_rgb, measured_state)
-        chunk = pack_heads(output)[0].cpu().numpy()
-        if not np.isfinite(chunk).all():
-            raise FloatingPointError("Nonfinite policy output")
-        selected = self.ensemble.select(self.step, chunk) if self.ensemble else chunk[0]
+        if self._cached_chunk is None or self._cache_index >= self.execution_horizon:
+            output = self._predict(images_rgb, measured_state)
+            packet = pack_heads(output)[0].cpu()
+            if not torch.isfinite(packet).all():
+                raise FloatingPointError("Nonfinite policy output")
+            self._cached_chunk = decode_packet(packet, self.stats).numpy()
+            if not np.isfinite(self._cached_chunk).all():
+                raise FloatingPointError("Nonfinite decoded policy output")
+            self._cache_index = 0
+        selected = self._cached_chunk[self._cache_index].copy()
+        self._cache_index += 1
         self.step += 1
-        return decode_packet(torch.from_numpy(selected), self.stats).numpy()
+        return selected

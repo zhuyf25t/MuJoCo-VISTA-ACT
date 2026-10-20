@@ -85,7 +85,7 @@ class RobotInterface(ABC):
 
     @abstractmethod
     def command_finger(self, goal_ctrl: float) -> None:
-        """手指滑动目标 (后端自定义标度)."""
+        """持续生效的手指滑动目标 (后端自定义标度)，重复写入不重置夹持判定。"""
 
     @abstractmethod
     def finger_ctrl_range(self) -> tuple[float, float]:
@@ -105,12 +105,8 @@ class RobotInterface(ABC):
             self.tick(on_tick)
 
     # ---------- 夹持感知 ----------
-    # 闭爪命令开启一次抓取尝试；稳定双侧夹持后才启用仿真辅助。
-    # 动作结束关闭尝试，保留已确认的夹持；开爪/reset 清空全部抓取状态。
-    @abstractmethod
-    def finish_grasp_attempt(self) -> None:
-        """结束本次抓取判定，清空候选；不解除已经确认的夹持。"""
-
+    # 闭合目标持续允许稳定双侧接触判定，与控制动作的等待时长无关。
+    # 开爪/reset 清空全部抓取状态；持续失去有效夹持则解除辅助约束。
     @abstractmethod
     def attach_object(self, name: str) -> None:
         """按当前夹爪-物体相对位姿吸附物体."""

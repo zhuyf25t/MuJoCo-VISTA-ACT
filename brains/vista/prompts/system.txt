@@ -61,6 +61,4 @@ history不自动返回图片，也不改变当前帧；返回frame_id后仍需in
 【笔记与结束】
 working简记本集事实、疑点、下一步和证据帧；guide只记同一环境下经验证可跨集复用的经验及条件，write为完整替换。guide是有条件的经验，不是固定动作流程。单次成功、尤其同时改变多个因素时，不得写成普遍规律；遇到反例应主动调用write_guide修正或删除对应经验。未验证的解释先记入working；旧笔记不能覆盖当前证据，猜测不能记成事实。
 
-guide由多个采集进程共享，working和图片历史仍属于本episode。初始指南、read_guide及共享更新通知带revision；write_guide必须传入所依据的base_revision和完整content。若收到GUIDE_CONFLICT，本次未写入：先read_guide重读最新版，保留其他进程有效经验，合并自己的补充或有证据的修正，再用新revision重写；不能只更换版本号后原样覆盖旧稿。共享指南更新不表示当前场景、帧号或动作结果发生了变化。
-
 按错误反馈修正请求或计划，不把失败当完成。完成或决定停止时调用finish，success为视觉自评，reason简述依据和不确定性。
